@@ -54,7 +54,7 @@
     "react-markdown": "10.1.0",
     "undici": "7.29.1",
     "zod": "4.4.3",
-    "@adaam/eve-workspace-runtime-bridge": "file:packages/adaam-eve-workspace-runtime-bridge-0.0.2.tgz"
+    "@adaam/eve-workspace-runtime-bridge": "file:packages/adaam-eve-workspace-runtime-bridge-0.0.3.tgz"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

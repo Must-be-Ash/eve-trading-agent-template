@@ -215,6 +215,9 @@ set the canonical HTTPS URL, and deploy. Verify Eve's generated monitor cron is
 present; `eve dev` does not automatically run schedules. Custom self-hosting must
 run the Eve production server/scheduler as well as the frontend.
 
+Keep development servers private. Never set `EVE_DEV=1` in production: Eve's
+local development authentication deliberately trusts that flag.
+
 Production Eve session routes require same-project Vercel OIDC. User trading enters
 through verified Photon. Keep webhook and mini-app routes reachable under your
 hosting protection policy. The landing page is informational, not a trading terminal.
@@ -251,8 +254,10 @@ tests/             Offline behavioral and safety checks
 docs/submission.md Gallery research, draft listing, remaining publication steps
 ```
 
-The repository remains private for review. It has not been submitted to Eve or
-deployed by this extraction. The [submission notes](docs/submission.md) describe the
-curated gallery process and the later public-repository requirement.
+This repository is open source. It has not been submitted to Eve or deployed by
+this extraction. The [submission notes](docs/submission.md) describe the remaining
+curated gallery process.
 
 MIT licensed. Reused Adaam components retain the 2026 Ash Nouruzi copyright.
+See [third-party notices](THIRD_PARTY_NOTICES.md) for bundled components and marks,
+and [the security policy](SECURITY.md) to report a vulnerability privately.

@@ -1,6 +1,6 @@
 # Eve gallery submission
 
-Researched on October 15, 2026. This repository is a private submission candidate,
+Researched on October 15, 2026. This repository is an open-source submission candidate,
 not an accepted or published Eve template.
 
 ## What the examples establish
@@ -25,8 +25,8 @@ configurable application rather than a fixed maximum number of features.
 Eve's [gallery manifest](https://github.com/vercel/eve/blob/main/apps/docs/lib/templates/manifest.ts)
 defines curated entries. Its [sync script](https://github.com/vercel/eve/blob/main/apps/docs/scripts/sync-templates.ts)
 loads a repository README and selected source files from GitHub. There is no
-repository-side `template.json` registration contract. The current public sync path
-cannot read this private repository.
+repository-side `template.json` registration contract. The public sync path requires a public repository. Making the source public
+does not automatically register or approve a gallery listing.
 
 The [standalone-template guidance](https://github.com/vercel/eve/blob/main/apps/templates/README.md)
 expects independent package/configuration files, a lockfile, a normal published Eve
@@ -72,16 +72,16 @@ a live demo until a separate deployment has been configured and checked.
 
 ## Before proposing the listing
 
-1. Review the private repository and complete owner-controlled deployment and
+1. Review the repository and complete owner-controlled deployment and
    Photon/Coinbase acceptance with new credentials and resources.
 2. Add representative screenshots from that deployment using public sample data.
-3. Make the repository public when the owner is ready; leave the GitHub template
-   flag enabled so others can use it without inheriting history.
+3. Keep the repository public and its GitHub template flag enabled so others can
+   use it without inheriting history.
 4. Follow Eve's [contribution policy](https://github.com/vercel/eve/blob/main/CONTRIBUTING.md):
    propose the addition in an issue and obtain a maintainer invitation before an
    upstream PR. Follow their signing and DCO requirements for that contribution.
 5. Adapt the manifest entry to the current schema, run the upstream sync/build,
    and let maintainers review it. Acceptance is their decision.
 
-No upstream issue, PR, public listing, or service deployment was created as part
-of preparing this private repository.
+No upstream issue, PR, Eve gallery listing, or service deployment was created as
+part of preparing this repository.
