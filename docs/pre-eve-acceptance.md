@@ -19,6 +19,25 @@ not provider charges. Nothing was pushed, deployed, submitted, or sent to a pers
 
 ## Scope of the evidence
 
+### Relationship to Adaam
+
+A subsequent read-only source comparison used Adaam commit
+`dcb15c82b5cd7db7c50ec71051bad62b8278ae24` as the working implementation reference.
+The template retains Adaam's session, approval, monitoring, research and artifact
+plumbing. The runtime bridge JavaScript and type declarations are byte-identical;
+its package version change adds licensing metadata. The scheduler is extracted
+from Adaam's event dispatcher with unsupported event/earnings paths removed. One
+configurable X playbook remains, alongside Photon, Coinbase and artifact views.
+
+Seven of the eight audited failure patterns also exist in the compared Adaam
+source. That establishes shared provenance, not observed Adaam production failures.
+Adaam has no simpler corrected implementation of those paths to copy. The remaining
+failure was introduced when template commit `ed1eae8` added deployment-wide semantic
+budget caps but omitted accepted-result settlement. Its repair reuses the existing
+receipt and ledger helper, preserving that protection. None of the eight repairs
+introduces a separate service or parallel runtime. No additional runtime changes
+were needed after the comparison, and Adaam itself was not modified.
+
 `proved locally` means an asserted executable result with the stated external
 fixtures. `proved live` requires the real configured service; there are no such
 claims in this audit. `blocked` identifies a missing prerequisite or action outside
