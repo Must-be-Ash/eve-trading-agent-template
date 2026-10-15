@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
+import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import { Readable } from "node:stream";
 
 import { get, put } from "@vercel/blob";
 
@@ -184,7 +186,8 @@ function validateKindContentType(
   }
 }
 
-async function assertPublicRemoteUrl(url: URL): Promise<void> {
+async function resolvePublicRemoteUrl(url: URL, signal: AbortSignal): Promise<string> {
+  signal.throwIfAborted();
   const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/gu, "");
   if (
     url.protocol !== "https:" ||
@@ -202,16 +205,69 @@ async function assertPublicRemoteUrl(url: URL): Promise<void> {
     if (!isPublicNetworkAddress(hostname)) {
       throw new Error("Artifact sources cannot use a private network address.");
     }
-    return;
+    return hostname;
   }
 
-  const addresses = await lookup(hostname, { all: true, verbatim: true });
+  const addresses = await new Promise<Array<{ address: string; family: number }>>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    lookup(hostname, { all: true, verbatim: true }).then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
   if (
     addresses.length === 0 ||
     addresses.some(({ address }) => !isPublicNetworkAddress(address))
   ) {
     throw new Error("The artifact source did not resolve to a public address.");
   }
+  return addresses[0]!.address;
+}
+
+async function fetchPinnedArtifactSource(
+  url: URL,
+  address: string,
+  signal: AbortSignal,
+): Promise<Response> {
+  return new Promise<Response>((resolve, reject) => {
+    // Keep the URL hostname for TLS, while binding this connection to the
+    // validated address. A fresh agent prevents reuse of an unvalidated socket.
+    const request = httpsRequest(url, {
+      agent: false,
+      headers: {
+        Accept: "image/*, audio/*, video/*, application/pdf, application/octet-stream",
+        "Accept-Encoding": "identity",
+        "User-Agent": "EveArtifactPublisher/1.0",
+      },
+      lookup: (_hostname, options, callback) => {
+        const family = isIP(address);
+        if (options.all) callback(null, [{ address, family }]);
+        else callback(null, address, family);
+      },
+      method: "GET",
+      signal,
+    }, (incoming) => {
+      try {
+        const status = incoming.statusCode;
+        if (status === undefined) throw new Error("The artifact source could not be downloaded.");
+        const headers = new Headers();
+        for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
+          headers.append(incoming.rawHeaders[index]!, incoming.rawHeaders[index + 1]!);
+        }
+        const bodyless = status === 204 || status === 205 || status === 304;
+        if (bodyless) incoming.destroy();
+        resolve(new Response(
+          bodyless ? null : Readable.toWeb(incoming) as ReadableStream<Uint8Array>,
+          { headers, status },
+        ));
+      } catch (error) {
+        incoming.destroy();
+        reject(error);
+      }
+    });
+    request.once("error", reject);
+    request.end();
+  });
 }
 
 function combineAbortSignals(signal: AbortSignal | undefined): AbortSignal {
@@ -227,18 +283,12 @@ async function fetchPublicArtifactSource(
   const combinedSignal = combineAbortSignals(signal);
 
   for (let redirect = 0; redirect <= MAX_REMOTE_REDIRECTS; redirect += 1) {
-    await assertPublicRemoteUrl(currentUrl);
-    const response = await fetch(currentUrl, {
-      headers: {
-        Accept: "image/*, audio/*, video/*, application/pdf, application/octet-stream",
-        "User-Agent": "EveArtifactPublisher/1.0",
-      },
-      redirect: "manual",
-      signal: combinedSignal,
-    });
+    const address = await resolvePublicRemoteUrl(currentUrl, combinedSignal);
+    const response = await fetchPinnedArtifactSource(currentUrl, address, combinedSignal);
 
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("location");
+      await response.body?.cancel().catch(() => undefined);
       if (!location || redirect === MAX_REMOTE_REDIRECTS) {
         throw new Error("The artifact source redirected too many times.");
       }
@@ -247,6 +297,7 @@ async function fetchPublicArtifactSource(
     }
 
     if (!response.ok || !response.body) {
+      await response.body?.cancel().catch(() => undefined);
       throw new Error("The artifact source could not be downloaded.");
     }
     return response;

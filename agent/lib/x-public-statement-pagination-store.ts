@@ -18,10 +18,15 @@ const itemSchema = z.object({
   factRevisionId: identifierSchema,
   recordDigest: digestSchema,
 }).strict();
-const indexSchema = z.object({
-  excludeReplies: z.boolean().optional(),
+const requestSchema = z.object({
+  excludeReplies: z.boolean(),
+  firstRunStartAt: z.string().datetime({ offset: true }).nullable(),
+  sourceInstanceId: identifierSchema,
+  window: z.object({ startAt: z.string().datetime({ offset: true }), endAt: z.string().datetime({ offset: true }) }).strict(),
+}).strict();
+type PaginationRequest = z.infer<typeof requestSchema>;
+const indexSchema = requestSchema.extend({
   expectedCursorRevision: z.number().int().nonnegative(),
-  firstRunStartAt: z.string().datetime({ offset: true }).nullable().optional(),
   items: z.array(itemSchema).max(MAX_ITEMS),
   nextToken: z.string().min(1).max(500),
   pagesRead: z.number().int().positive().max(500),
@@ -29,7 +34,6 @@ const indexSchema = z.object({
   recordType: z.literal("x_public_statement_pagination_continuation"),
   revision: z.number().int().nonnegative(),
   schemaVersion: z.literal(1),
-  sourceInstanceId: identifierSchema,
 }).strict();
 const recordSchema = z.object({
   correction: publicSourceCorrectionSchema.nullable(),
@@ -48,12 +52,16 @@ function digest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
-function indexKey(sourceInstanceId: string): string {
-  return `x-pagination:v1:index:${digest(sourceInstanceId)}`;
+function requestDigest(request: PaginationRequest): string {
+  return digest([request.sourceInstanceId, request.window.startAt, request.window.endAt, request.excludeReplies, request.firstRunStartAt]);
 }
 
-function itemKey(sourceInstanceId: string, factRevisionId: string): string {
-  return `x-pagination:v1:item:${digest([sourceInstanceId, factRevisionId])}`;
+function indexKey(request: PaginationRequest): string {
+  return `x-pagination:v2:index:${requestDigest(request)}`;
+}
+
+function itemKey(request: PaginationRequest, factRevisionId: string): string {
+  return `x-pagination:v2:item:${digest([requestDigest(request), factRevisionId])}`;
 }
 
 function raw(value: unknown): string | null {
@@ -62,11 +70,14 @@ function raw(value: unknown): string | null {
 }
 
 export async function readXPublicStatementPaginationContinuation(
-  sourceInstanceId: string,
+  request: PaginationRequest,
   client: RevocableEvidenceStoreClient,
 ): Promise<XPublicStatementPaginationContinuation | null> {
-  const value = raw(await client.get(indexKey(sourceInstanceId)));
-  return value === null ? null : indexSchema.parse(JSON.parse(value));
+  const value = raw(await client.get(indexKey(request)));
+  if (value === null) return null;
+  const continuation = indexSchema.parse(JSON.parse(value));
+  if (requestDigest(continuation) !== requestDigest(request)) throw new Error("x_pagination_continuation_conflict");
+  return continuation;
 }
 
 export async function readXPublicStatementPaginationItems(
@@ -74,7 +85,7 @@ export async function readXPublicStatementPaginationItems(
   client: RevocableEvidenceStoreClient,
 ): Promise<readonly XPublicStatementPaginationItem[]> {
   return Object.freeze(await Promise.all(continuation.items.map(async (item) => {
-    const value = raw(await client.get(itemKey(continuation.sourceInstanceId, item.factRevisionId)));
+    const value = raw(await client.get(itemKey(continuation, item.factRevisionId)));
     if (value === null || digest(JSON.parse(value)) !== item.recordDigest) {
       throw new Error("x_pagination_continuation_corrupt");
     }
@@ -82,22 +93,25 @@ export async function readXPublicStatementPaginationItems(
   })));
 }
 
-export async function appendXPublicStatementPaginationContinuation(input: {
-  readonly excludeReplies?: boolean;
+export async function appendXPublicStatementPaginationContinuation(input: PaginationRequest & {
   readonly expectedCursorRevision: number;
-  readonly firstRunStartAt?: string | null;
   readonly items: readonly XPublicStatementPaginationItem[];
   readonly nextToken: string;
   readonly pagesRead: number;
   readonly postsRead: number;
-  readonly sourceInstanceId: string;
 }, client: RevocableEvidenceStoreClient): Promise<XPublicStatementPaginationContinuation> {
-  const key = indexKey(input.sourceInstanceId);
+  const request = requestSchema.parse({
+    excludeReplies: input.excludeReplies,
+    firstRunStartAt: input.firstRunStartAt,
+    sourceInstanceId: input.sourceInstanceId,
+    window: input.window,
+  });
+  const key = indexKey(request);
   for (let offset = 0; offset < input.items.length; offset += 8) {
     await Promise.all(input.items.slice(offset, offset + 8).map(async (item) => {
       const record = recordSchema.parse({ ...item, recordType: "x_public_statement_pagination_item", schemaVersion: 1 });
       const serialized = JSON.stringify(record);
-      const recordKey = itemKey(input.sourceInstanceId, record.fact.revisionId);
+      const recordKey = itemKey(input, record.fact.revisionId);
       if (!(await client.compareAndSet(recordKey, null, serialized)) && raw(await client.get(recordKey)) !== serialized) {
         throw new Error("x_pagination_continuation_conflict");
       }
@@ -109,10 +123,7 @@ export async function appendXPublicStatementPaginationContinuation(input: {
     if (current && current.expectedCursorRevision !== input.expectedCursorRevision) {
       throw new Error("x_pagination_continuation_stale");
     }
-    if (current && (current.firstRunStartAt ?? null) !== (input.firstRunStartAt ?? null)) {
-      throw new Error("x_pagination_continuation_conflict");
-    }
-    if (current && (current.excludeReplies ?? false) !== (input.excludeReplies ?? false)) {
+    if (current && requestDigest(current) !== requestDigest(request)) {
       throw new Error("x_pagination_continuation_conflict");
     }
     const byRevision = new Map((current?.items ?? []).map((item) => [item.factRevisionId, item]));
@@ -130,9 +141,8 @@ export async function appendXPublicStatementPaginationContinuation(input: {
       byRevision.set(reference.factRevisionId, reference);
     }
     const next = indexSchema.parse({
+      ...request,
       expectedCursorRevision: input.expectedCursorRevision,
-      excludeReplies: input.excludeReplies ?? false,
-      firstRunStartAt: input.firstRunStartAt ?? null,
       items: [...byRevision.values()],
       nextToken: input.nextToken,
       pagesRead: (current?.pagesRead ?? 0) + input.pagesRead,
@@ -140,7 +150,6 @@ export async function appendXPublicStatementPaginationContinuation(input: {
       recordType: "x_public_statement_pagination_continuation",
       revision: (current?.revision ?? 0) + 1,
       schemaVersion: 1,
-      sourceInstanceId: input.sourceInstanceId,
     });
     if (await client.compareAndSet(key, currentRaw, JSON.stringify(next))) return next;
   }
@@ -153,36 +162,7 @@ export async function clearXPublicStatementPaginationContinuation(
 ): Promise<void> {
   for (let offset = 0; offset < continuation.items.length; offset += 8) {
     await Promise.all(continuation.items.slice(offset, offset + 8).map((item) =>
-      client.delete(itemKey(continuation.sourceInstanceId, item.factRevisionId))));
+      client.delete(itemKey(continuation, item.factRevisionId))));
   }
-  await client.delete(indexKey(continuation.sourceInstanceId));
-}
-
-// A resumed lookback can finish in a later window. Keep that window's request
-// lower bound after deleting its page payloads so retries find the same journal.
-const windowRequestSchema = z.object({
-  excludeReplies: z.boolean(),
-  firstRunStartAt: z.string().datetime({ offset: true }),
-  requestedFirstRunStartAt: z.string().datetime({ offset: true }).nullable(),
-  sourceInstanceId: identifierSchema,
-  window: z.object({ startAt: z.string().datetime({ offset: true }), endAt: z.string().datetime({ offset: true }) }).strict(),
-}).strict();
-type WindowRequestIdentity = Omit<z.infer<typeof windowRequestSchema>, "firstRunStartAt">;
-function windowRequestKey(input: WindowRequestIdentity): string {
-  return `x-pagination:v1:window:${digest([input.sourceInstanceId, input.window.startAt, input.window.endAt, input.excludeReplies, input.requestedFirstRunStartAt])}`;
-}
-export async function readXPublicStatementWindowLowerBound(input: WindowRequestIdentity, client: RevocableEvidenceStoreClient): Promise<string | null> {
-  const value = raw(await client.get(windowRequestKey(input)));
-  if (value === null) return null;
-  const stored = windowRequestSchema.parse(JSON.parse(value));
-  if (windowRequestKey(stored) !== windowRequestKey(input)) throw new Error("x_pagination_window_request_conflict");
-  return stored.firstRunStartAt;
-}
-export async function pinXPublicStatementWindowLowerBound(input: z.infer<typeof windowRequestSchema>, client: RevocableEvidenceStoreClient): Promise<void> {
-  const stored = windowRequestSchema.parse(input);
-  const key = windowRequestKey(stored);
-  const serialized = JSON.stringify(stored);
-  if (!(await client.compareAndSet(key, null, serialized)) && raw(await client.get(key)) !== serialized) {
-    throw new Error("x_pagination_window_request_conflict");
-  }
+  await client.delete(indexKey(continuation));
 }

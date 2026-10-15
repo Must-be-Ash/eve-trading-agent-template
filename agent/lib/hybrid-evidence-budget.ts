@@ -105,15 +105,14 @@ export async function reconcileRecordedHybridEvidenceAttempt(input: {
       runId: input.receipt.reservationKey,
       scope,
     }, clients.workspace) : Promise.resolve(),
-    input.receipt.lane === "source_global_extraction"
-      ? reconcileHybridEvidenceDeploymentBudget({
+    reconcileHybridEvidenceDeploymentBudget({
         actualInputTokens: input.actualInputTokens,
         actualOutputTokens: input.actualOutputTokens,
         actualPaidCost: input.actualPaidCost,
         now: input.now,
         outcome: input.outcome,
         reservationKey: input.receipt.reservationKey,
-      }, clients.global) : Promise.resolve(),
+      }, clients.global),
   ]);
 }
 
@@ -304,21 +303,46 @@ export async function reserveHybridEvidenceAttempt(input: {
   if (!capabilities.value.workerModelPolicy.allowedModelIds.includes(input.job.modelId)) {
     throw new HybridEvidenceBudgetError("model_denied");
   }
-  const reservation = await reserveWorkspaceRunBudget({
-    inputTokens: input.definition.limits.maximumInputTokens,
-    kind: "hybrid_model_attempt",
+  const inputTokens = input.aggregateLimits?.inputTokens ?? input.definition.limits.maximumInputTokens;
+  const outputTokens = input.aggregateLimits?.outputTokens ?? Math.min(
+    input.definition.limits.maximumOutputTokens,
+    capabilities.value.workerModelPolicy.maximumOutputTokens,
+  );
+  await reserveHybridEvidenceDeploymentBudget({
+    inputTokens,
+    modelId: input.job.modelId,
     now: input.now,
-    outputTokens: Math.min(
-      input.definition.limits.maximumOutputTokens,
-      capabilities.value.workerModelPolicy.maximumOutputTokens,
-    ),
-    paidCostCeiling: { amount: input.definition.limits.maximumPaidCostUsd, kind: "known" },
-    parentRunId: input.parentRunId,
-    policy: budget.value,
-    policyRevision: budget.revision,
-    runId: input.job.budgetReservation.key,
-    scope: input.scope,
-  }, clients.workspace);
+    outputTokens,
+    paidCostCeiling: input.definition.limits.maximumPaidCostUsd,
+    reservationKey: input.job.budgetReservation.key,
+  }, { client: clients.global, environment: input.environment });
+  let reservation: WorkspaceBudgetReservation;
+  try {
+    reservation = await reserveWorkspaceRunBudget({
+      inputTokens,
+      kind: "hybrid_model_attempt",
+      now: input.now,
+      outputTokens,
+      paidCostCeiling: { amount: input.definition.limits.maximumPaidCostUsd, kind: "known" },
+      parentRunId: input.parentRunId,
+      policy: budget.value,
+      policyRevision: budget.revision,
+      runId: input.job.budgetReservation.key,
+      scope: input.scope,
+    }, clients.workspace);
+  } catch (error) {
+    // No child call has started. Keep ambiguous ledger writes reserved, but a
+    // conclusive local policy denial can return its deployment allowance.
+    if (error instanceof WorkspaceBudgetError &&
+      ["budget_exhausted", "budget_policy_stale", "budget_policy_unresolved"].includes(error.code)) {
+      await reconcileHybridEvidenceDeploymentBudget({
+        now: input.now,
+        outcome: "released",
+        reservationKey: input.job.budgetReservation.key,
+      }, clients.global);
+    }
+    throw error;
+  }
   return Object.freeze({
     lane: "workspace_semantic" as const,
     parentRunId: input.parentRunId ?? null,
@@ -361,7 +385,7 @@ export async function reconcileHybridEvidenceAttempt(input: {
     }, clients.global)]);
     return;
   }
-  await reconcileWorkspaceRunBudget({
+  await Promise.all([reconcileWorkspaceRunBudget({
     actualInputTokens: input.actualInputTokens,
     actualOutputTokens: input.actualOutputTokens,
     actualPaidCost: input.actualPaidCost,
@@ -369,5 +393,12 @@ export async function reconcileHybridEvidenceAttempt(input: {
     outcome: input.outcome,
     runId: input.reservation.reservationKey,
     scope: input.reservation.scope,
-  }, clients.workspace);
+  }, clients.workspace), reconcileHybridEvidenceDeploymentBudget({
+    actualInputTokens: input.actualInputTokens,
+    actualOutputTokens: input.actualOutputTokens,
+    actualPaidCost: input.actualPaidCost,
+    now: input.now,
+    outcome: input.outcome,
+    reservationKey: input.reservation.reservationKey,
+  }, clients.global)]);
 }

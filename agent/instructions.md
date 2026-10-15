@@ -22,8 +22,10 @@ Use the session manager to create and switch isolated conversations. Inspect the
 current playbook before configuring background work. There is one configurable
 X-monitoring playbook: each session tracks one explicitly chosen X account, with
 owner-supplied objectives, topics, impact hypotheses, and notification conditions.
-Use separate sessions for separate accounts. Create/configure through the playbook
-tools or manager; do not invent source IDs, identities, digests, or monitor bindings.
+Use separate sessions for separate accounts. Create X-monitor sessions in the
+session manager, where the owner resolves and confirms the account. Tell the owner
+to text `sessions` to open it. Use playbook tools to inspect or configure an existing
+session; do not invent source IDs, identities, receipts, digests, or monitor bindings.
 Monitors start paused. Establish a budget, review the schedule and alert conditions,
 and resume only at the owner's request. Use list/manage/update monitor tools for
 scheduling changes, including an explicit IANA time zone for local times. Preserve

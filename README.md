@@ -127,9 +127,11 @@ budget: the owner's portfolio and per-order approvals control trading funds.
 
 ## Sessions, X monitors, and alerts
 
-Text the owner-authorized agent and open its session manager. Create ordinary
+Text `sessions` to the owner-authorized agent to open its session manager. Create ordinary
 conversations or install the **Public Commentary Tracker** playbook in a new
-session. Each instance tracks one explicitly selected X account; create additional
+session. X-monitor creation uses the manager's account-resolution and confirmation
+flow; chat tools inspect and manage existing monitors. Each instance tracks one
+explicitly selected X account; create additional
 sessions to follow additional accounts. Existing conversations and findings remain
 isolated when you switch between them.
 
@@ -187,7 +189,10 @@ monitor. X retrieval, Gateway, and Exa prices must be checked against your accou
 The deployment caps in `.env.example` supplement per-session limits; they are not an
 all-services invoice cap. The inherited `EVE_HYBRID_SOURCE_RECOVERY_*` variable names
 also govern semantic child workers. Unknown X worker outcomes are quarantined and
-paused; this template does not automatically repeat uncertain paid work.
+paused; this template does not automatically repeat uncertain paid work. A timeline
+window that exceeds the bounded pagination allowance also pauses for inspection;
+its saved pages are retained, but automatic continuation is not included. Shorter
+cadences reduce the number of posts each window must cover.
 
 ## Develop and deploy
 

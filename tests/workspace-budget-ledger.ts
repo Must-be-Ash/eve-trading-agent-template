@@ -10,6 +10,11 @@ import {
   type WorkspaceBudgetLedgerClient,
 } from "../agent/lib/workspace-budget-ledger";
 import { authorizePhotonWorkspaceControlPlaneStore } from "../agent/lib/workspace-store-authorization";
+import { writeWorkspaceDocument } from "../agent/lib/workspace-state-store";
+import { createWorkspaceSemanticDefinition } from "../agent/lib/hybrid-evidence-definition-registry";
+import { hybridEvidenceJobSchema } from "../agent/lib/hybrid-evidence-schema";
+import { reserveHybridEvidenceAttempt, reconcileHybridEvidenceAttempt, reconcileRecordedHybridEvidenceAttempt, createHybridEvidenceAttemptReceipt } from "../agent/lib/hybrid-evidence-budget";
+import { readGlobalDispatchBudgetLedger, WorkspaceDispatchBudgetError } from "../agent/lib/workspace-dispatch-budget";
 
 class MemoryStore implements WorkspaceBudgetLedgerClient {
   getCalls = 0;
@@ -555,5 +560,77 @@ for (const parentState of ["reserved", "reconciled", "released", "missing", "pre
     `${parentState}: ${hardLimit} admission must agree with summary`);
   }
 }
+
+
+// Separate sessions share the deployment cap even when each has room locally.
+const semanticStore = new MemoryStore();
+const semanticEnvironment = {
+  ...environment,
+  EVE_HYBRID_SOURCE_RECOVERY_MODEL_IDS: "fixture/model",
+  EVE_HYBRID_SOURCE_RECOVERY_INPUT_TOKENS_PER_DAY: "500",
+  EVE_HYBRID_SOURCE_RECOVERY_OUTPUT_TOKENS_PER_DAY: "200",
+  EVE_HYBRID_SOURCE_RECOVERY_CONCURRENT_WORKERS: "2",
+};
+const semanticDefinition = createWorkspaceSemanticDefinition({
+  allowedAdapterIds: ["fixture-source"], definitionId: "fixture-analysis",
+  instruction: "Analyze public fixture evidence.", modelIds: ["fixture/model"],
+  outputSchemaId: "fixture-output", promptId: "fixture-prompt", validatorId: "fixture-validator",
+  limits: { maximumInputTokens: 300, maximumOutputTokens: 100, maximumPaidCostUsd: "0.10" },
+});
+const semanticScopes = [scope, authorizePhotonWorkspaceControlPlaneStore({
+  principalId: environment.PHOTON_ALLOWED_PRINCIPALS, resource: "worker",
+  workspaceId: "223e4567-e89b-42d3-a456-426614174000",
+}, environment)];
+for (const semanticScope of semanticScopes) {
+  await writeWorkspaceDocument("budget", { expectedRevision: 0, now, scope: semanticScope, value: policy }, semanticStore);
+  await writeWorkspaceDocument("capabilities", {
+    expectedRevision: 0, now, scope: semanticScope,
+    value: {
+      connectionIds: [], controlPlaneToolIds: [], financialToolIds: [],
+      hardDeniedCapabilityIds: ["financial.write"], maximumDataAccessClassification: "public",
+      paidResearchAllowed: true, providerTools: [], researchToolIds: [], skills: [], sources: [],
+      workerModelPolicy: { allowedModelIds: ["fixture/model"], maximumOutputTokens: 100 },
+    },
+  }, semanticStore);
+}
+function semanticJob(id: string, semanticScope = scope) {
+  return hybridEvidenceJobSchema.parse({
+    artifactDigests: ["a".repeat(64)], attempt: 0,
+    budgetReservation: { key: `hybrid:${id}`, kind: "hybrid_model_attempt", scope: "workspace" },
+    completedAt: null, createdAt: now.toISOString(), definitionDigest: semanticDefinition.definitionDigest,
+    definitionId: semanticDefinition.definitionId, definitionVersion: "1.0.0", idempotencyKey: "b".repeat(64),
+    inputDigest: "c".repeat(64), jobId: id, locatorDigests: ["d".repeat(64)], modelId: "fixture/model",
+    purpose: "semantic_interpretation", recordType: "hybrid_evidence_job", schemaVersion: 1,
+    scope: { kind: "workspace", bindingRevision: 1, ownerId: semanticScope.ownerId,
+      workspaceId: semanticScope.workspaceId, packContentDigest: "e".repeat(64), packId: "fixture-pack", packVersion: "1.0.0" },
+    startedAt: null, state: "prepared", updatedAt: now.toISOString(),
+  });
+}
+const semanticClients = { global: semanticStore, workspace: semanticStore, state: semanticStore };
+const reserveSemantic = (id: string, semanticScope = scope, overrides = {}) => reserveHybridEvidenceAttempt({
+  definition: semanticDefinition, environment: { ...semanticEnvironment, ...overrides },
+  job: semanticJob(id, semanticScope), now, scope: semanticScope,
+}, semanticClients);
+await assert.rejects(reserveSemantic("disabled", scope, { EVE_HYBRID_SOURCE_RECOVERY_PAID_PER_CALL: "0" }),
+  (error) => error instanceof WorkspaceDispatchBudgetError && error.code === "global_budget_exhausted");
+const semanticFirst = await reserveSemantic("first");
+await reconcileHybridEvidenceAttempt({ reservation: semanticFirst, outcome: "uncertain", now }, semanticClients);
+await assert.rejects(reserveSemantic("second-blocked", semanticScopes[1]),
+  (error) => error instanceof WorkspaceDispatchBudgetError && error.code === "global_budget_exhausted");
+assert.equal((await readGlobalDispatchBudgetLedger(semanticStore)).reservations[0]?.state, "uncertain");
+await reconcileRecordedHybridEvidenceAttempt({
+  receipt: createHybridEvidenceAttemptReceipt(semanticFirst), environment, now,
+  outcome: "reconciled", actualInputTokens: 100, actualOutputTokens: 50, actualPaidCost: "0.05",
+}, semanticClients);
+const semanticSecond = await reserveSemantic("second", semanticScopes[1]);
+await reconcileHybridEvidenceAttempt({ reservation: semanticSecond, outcome: "released", now }, semanticClients);
+// Local admission can still reject after global admission; no call started, so release both allowances.
+await writeWorkspaceDocument("budget", { expectedRevision: 1, now, scope, value: { ...policy, maximumPaidPerDay: "0.01" } }, semanticStore);
+await assert.rejects(reserveSemantic("local-denied"),
+  (error) => error instanceof WorkspaceBudgetError && error.code === "budget_exhausted");
+const globalSemantic = (await readGlobalDispatchBudgetLedger(semanticStore)).reservations;
+assert.equal(globalSemantic.find(({ runId }) => runId === "hybrid:local-denied")?.state, "released");
+assert.equal(globalSemantic.find(({ runId }) => runId === "hybrid:first")?.reconciledInputTokens, 100);
+assert.equal((await readWorkspaceBudgetLedger(scope, semanticStore)).reservations[0]?.reconciledInputTokens, 100);
 
 console.log("Atomic workspace budget ledger verification passed.");

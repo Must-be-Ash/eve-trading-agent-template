@@ -298,6 +298,10 @@ export async function drainPublicCommentaryHybridWorker(
   const handle = await startWorker(request);
   const reader = handle.events.getReader();
   let completed = false;
+  let settled = false;
+  let usageComplete = true;
+  let settlementDeadline: Promise<never> | null = null;
+  let settlementTimer: ReturnType<typeof setTimeout> | undefined;
   let terminalFailure: Readonly<{ code: string; message: string }> | null = null;
   // Accumulate the child session's actual model usage so the parent reconciles
   // this attempt's token reservation at what it really spent, instead of
@@ -319,10 +323,15 @@ export async function drainPublicCommentaryHybridWorker(
   let lastToolErrored = false;
   try {
     for (;;) {
-      const next = await reader.read();
+      const next = await (settlementDeadline
+        ? Promise.race([reader.read(), settlementDeadline])
+        : reader.read());
       if (next.done) break;
       const event = next.value;
       if (event.type === "step.completed") {
+        if (event.data.usage?.inputTokens === undefined || event.data.usage.outputTokens === undefined) {
+          usageComplete = false;
+        }
         inputTokens += event.data.usage?.inputTokens ?? 0;
         outputTokens += event.data.usage?.outputTokens ?? 0;
       }
@@ -342,22 +351,33 @@ export async function drainPublicCommentaryHybridWorker(
         event.data.result.toolName === "complete_hybrid_evidence_job" &&
         event.data.result.isError !== true
       ) {
+        if (!completed) {
+          // Eve emits this action before its usage event and can run a final
+          // model step afterward. Wait briefly for the terminal turn, not for
+          // stream closure. If it cannot settle, the caller keeps the full
+          // conservative allowance rather than reporting partial usage.
+          settlementDeadline = new Promise<never>((_resolve, reject) => {
+            settlementTimer = setTimeout(() => reject(new Error("completion_usage_unsettled")), 5_000);
+          });
+        }
         completed = true;
-        // The completion tool has already durably committed the candidate.
-        // Do not wait for Eve's trailing session stream to settle: the parent
-        // workspace occurrence must still validate and accept that candidate
-        // within its own bounded execution window. Releasing the reader (and
-        // deliberately not cancelling it) lets the child session settle on
-        // its own without generating a post-completion cancellation failure.
-        break;
       }
       if (
         event.type === "step.failed" ||
         event.type === "turn.failed" ||
         event.type === "session.failed"
-      ) terminalFailure = Object.freeze({ code: event.data.code, message: event.data.message });
+      ) {
+        usageComplete = false;
+        terminalFailure = Object.freeze({ code: event.data.code, message: event.data.message });
+      }
+      if (event.type === "turn.completed" || event.type === "session.completed") {
+        settled = true;
+        break;
+      }
     }
   } finally {
+    clearTimeout(settlementTimer);
+    // Cancelling the stream here races Eve's durable terminal writes.
     reader.releaseLock();
   }
   if (!completed) {
@@ -373,6 +393,7 @@ export async function drainPublicCommentaryHybridWorker(
       : `completion_missing:tools=${toolCalls}:last=${lastTool ?? "none"}:err=${lastToolErrored}`;
     throw new Error(`hybrid_evidence_worker_failed:${suffix}`);
   }
+  if (!settled || !usageComplete) throw new Error("completion_usage_unsettled");
   return { inputTokens, outputTokens };
 }
 

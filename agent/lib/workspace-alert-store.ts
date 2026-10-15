@@ -7,15 +7,31 @@ import type { WorkspaceFinding } from "./workspace-finding-store";
 import type { WorkspaceMonitor } from "./workspace-monitor-store";
 import {
   assertAuthorizedWorkspaceStoreScope,
+  authorizeDeploymentWorkspaceStore,
   type AuthorizedWorkspaceStoreScope,
 } from "./workspace-store-authorization";
 
 const KEY_PREFIX = "eve:workspace-runtime:v1:alert:";
+const PENDING_KEY = `${KEY_PREFIX}pending`;
 const CREATE_SCRIPT = `
 local current = redis.call("GET", KEYS[1])
-if current then return current end
-redis.call("SET", KEYS[1], ARGV[1])
-return ARGV[1]
+if not current then
+  redis.call("SET", KEYS[1], ARGV[1])
+  for index = 2, #KEYS do redis.call("ZADD", KEYS[index], ARGV[2], KEYS[1]) end
+end
+return current or ARGV[1]
+`;
+const LIST_SCRIPT = `
+local members = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, ARGV[2])
+local result = {}
+for _, member in ipairs(members) do
+  local raw = redis.call("GET", member)
+  if raw then
+    table.insert(result, raw)
+    if ARGV[3] ~= "" then redis.call("ZADD", KEYS[1], ARGV[3], member) end
+  else redis.call("ZREM", KEYS[1], member) end
+end
+return result
 `;
 const CAS_SCRIPT = `
 if redis.call("GET", KEYS[1]) ~= ARGV[1] then return 0 end
@@ -34,6 +50,9 @@ const alertSchema = z.object({
   alertId: idSchema,
   artifactRefs: z.array(idSchema).max(8).optional(),
   createdAt: timestampSchema,
+  configurationRevision: z.number().int().positive(),
+  deliverySubscriptionId: idSchema,
+  monitorId: z.string().uuid(),
   eventTime: timestampSchema.optional(),
   findingId: idSchema,
   ownerId: idSchema,
@@ -70,7 +89,9 @@ export type WorkspaceAlertDelivery = z.infer<typeof deliverySchema>;
 
 export interface WorkspaceAlertStoreClient {
   compareAndSet(key: string, expected: string, next: string): Promise<boolean>;
-  createOrRead(key: string, value: string): Promise<unknown>;
+  createOrRead(key: string, value: string, indexes?: readonly string[], score?: number): Promise<unknown>;
+  list(indexKey: string, limit: number, nowMs: number, retryAtMs?: number): Promise<unknown[]>;
+  remove(indexKey: string, recordKey: string): Promise<unknown>;
   get(key: string): Promise<unknown>;
 }
 
@@ -103,16 +124,20 @@ function store(): WorkspaceAlertStoreClient {
         return (await redisClient!.evalsha<[string, string], number>(await casSha, [key], [expected, next])) === 1;
       }
     },
-    async createOrRead(key, value) {
+    async createOrRead(key, value, indexes = [], score = 0) {
       try {
-        return await redisClient!.evalsha<[string], string>(await sha, [key], [value]);
+        return await redisClient!.evalsha<[string, string], string>(await sha, [key, ...indexes], [value, String(score)]);
       } catch (error) {
         if (!(error instanceof Error) || !error.message.includes("NOSCRIPT")) throw error;
         sha = redisClient!.scriptLoad(CREATE_SCRIPT);
-        return redisClient!.evalsha<[string], string>(await sha, [key], [value]);
+        return redisClient!.evalsha<[string, string], string>(await sha, [key, ...indexes], [value, String(score)]);
       }
     },
     get: (key) => redisClient!.get(key),
+    list: (indexKey, limit, nowMs, retryAtMs) => redisClient!.eval<[string, string, string], unknown[]>(
+      LIST_SCRIPT, [indexKey], [String(nowMs), String(limit), retryAtMs === undefined ? "" : String(retryAtMs)],
+    ),
+    remove: (indexKey, recordKey) => redisClient!.zrem(indexKey, recordKey),
   };
   return defaultClient;
 }
@@ -167,6 +192,9 @@ export async function stageWorkspaceAlert(input: {
      */
     artifactRefs: input.presentation?.artifactRefs ?? input.finding.artifactRefs,
     createdAt: (input.now ?? new Date()).toISOString(),
+    configurationRevision: input.monitor.configurationRevision,
+    deliverySubscriptionId: input.monitor.deliverySubscriptionId,
+    monitorId: input.monitor.monitorId,
     eventTime: input.finding.asOf,
     findingId: input.finding.findingId,
     ownerId: input.scope.ownerId,
@@ -187,6 +215,8 @@ export async function stageWorkspaceAlert(input: {
   const value = await client.createOrRead(
     key(input.scope, "alert", alertId),
     JSON.stringify(candidate),
+    [key(input.scope, "finding", input.finding.findingId), PENDING_KEY],
+    Date.parse(candidate.createdAt),
   );
   const result = parse(alertSchema, value, input.scope);
   if (result.findingId !== input.finding.findingId) {
@@ -284,7 +314,7 @@ export async function claimWorkspaceAlertDelivery(
     const currentRaw = serialized(await client.get(recordKey));
     if (!currentRaw) throw new WorkspaceAlertStoreError("alert_corrupt");
     const current = parse(deliverySchema, currentRaw, input.scope);
-    if (current.state !== "staged" && current.state !== "retryable_failure") {
+    if ((current.state !== "staged" && current.state !== "retryable_failure") || current.attempt >= 8) {
       return { claimed: false, delivery: current };
     }
     const next = deliverySchema.parse({
@@ -395,4 +425,47 @@ export async function readWorkspaceAlertById(
     throw new WorkspaceAlertStoreError("alert_conflict");
   }
   return alert;
+}
+
+
+export async function readWorkspaceAlertsForFinding(
+  scope: AuthorizedWorkspaceStoreScope,
+  findingId: string,
+  client: WorkspaceAlertStoreClient = store(),
+): Promise<WorkspaceAlert[]> {
+  assertAuthorizedWorkspaceStoreScope(scope);
+  const values = await client.list(key(scope, "finding", findingId), 50, Number.MAX_SAFE_INTEGER);
+  return values.map((value) => {
+    const alert = parse(alertSchema, value, scope);
+    if (alert.findingId !== findingId) throw new WorkspaceAlertStoreError("alert_conflict");
+    return alert;
+  });
+}
+
+export async function listPendingWorkspaceAlerts(input: {
+  limit: number;
+  now: Date;
+}, client: WorkspaceAlertStoreClient = store()): Promise<{
+  alert: WorkspaceAlert;
+  scope: AuthorizedWorkspaceStoreScope;
+}[]> {
+  const limit = z.number().int().min(1).max(20).parse(input.limit);
+  // Rotate each bounded batch before I/O so a permanently unavailable recipient
+  // cannot starve later alerts. Only alert-delivery claims authorize a send.
+  const values = await client.list(PENDING_KEY, limit, input.now.getTime(), input.now.getTime() + 60_000);
+  return values.map((value) => {
+    const raw = serialized(value);
+    const alert = alertSchema.parse(JSON.parse(raw ?? "null"));
+    const scope = authorizeDeploymentWorkspaceStore({ ownerId: alert.ownerId, workspaceId: alert.workspaceId });
+    return { alert: parse(alertSchema, value, scope), scope };
+  });
+}
+
+export async function removePendingWorkspaceAlert(
+  scope: AuthorizedWorkspaceStoreScope,
+  alertId: string,
+  client: WorkspaceAlertStoreClient = store(),
+): Promise<void> {
+  assertAuthorizedWorkspaceStoreScope(scope);
+  await client.remove(PENDING_KEY, key(scope, "alert", alertId));
 }

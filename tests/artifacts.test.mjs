@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { EventEmitter } from "node:events";
+import { Readable } from "node:stream";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
@@ -23,13 +25,15 @@ const bundled = await build({
   plugins: [{
     name: "artifact-test-io",
     setup(build) {
-      build.onResolve({ filter: /^(@vercel\/blob|node:dns\/promises)$/ }, ({ path }) =>
+      build.onResolve({ filter: /^(@vercel\/blob|node:dns\/promises|node:https)$/ }, ({ path }) =>
         ({ path, namespace: "artifact-test-io" }));
       build.onLoad({ filter: /.*/, namespace: "artifact-test-io" }, ({ path }) => ({
         contents: path === "@vercel/blob"
           ? `export const put = (...args) => globalThis.__artifactTestIO.put(...args);
              export const get = (...args) => globalThis.__artifactTestIO.get(...args);`
-          : `export const lookup = (...args) => globalThis.__artifactTestIO.lookup(...args);`,
+          : path === "node:https"
+            ? `export const request = (...args) => globalThis.__artifactTestIO.request(...args);`
+            : `export const lookup = (...args) => globalThis.__artifactTestIO.lookup(...args);`,
         loader: "js",
       }));
     },
@@ -419,11 +423,35 @@ async function withArtifactIO(run) {
   const previousFetch = globalThis.fetch;
   const writes = [];
   const requests = [];
+  const connections = [];
   const fixture = {
     addresses: [{ address: "8.8.8.8", family: 4 }],
     responses: [],
     readResult: null,
     async lookup() { return this.addresses; },
+    async fetch(url, options) {
+      const hostname = new URL(url).hostname;
+      const addresses = options.lookup
+        ? await new Promise((resolve, reject) => options.lookup(hostname, { all: true },
+          (error, result) => error ? reject(error) : resolve(result)))
+        : await this.lookup(hostname);
+      connections.push({ hostname, address: addresses[0].address });
+      requests.push({ url: String(url), options });
+      assert.ok(this.responses.length, "unexpected network request");
+      return this.responses.shift();
+    },
+    request(url, options, callback) {
+      const request = new EventEmitter();
+      request.end = () => {
+        this.fetch(url, options).then((response) => {
+          const incoming = response.body ? Readable.fromWeb(response.body) : Readable.from([]);
+          incoming.statusCode = response.status;
+          incoming.rawHeaders = [...response.headers.entries()].flat();
+          callback(incoming);
+        }, (error) => request.emit("error", error));
+      };
+      return request;
+    },
     async get() { return this.readResult; },
     async put(path, body, options) {
       let byteLength = 0;
@@ -439,13 +467,9 @@ async function withArtifactIO(run) {
   };
   process.env.PUBLIC_APP_URL = "https://eve.example";
   globalThis.__artifactTestIO = fixture;
-  globalThis.fetch = async (url, options) => {
-    requests.push({ url: String(url), options });
-    assert.ok(fixture.responses.length, "unexpected network request");
-    return fixture.responses.shift();
-  };
+  globalThis.fetch = (url, options) => fixture.fetch(url, options);
   try {
-    return await run({ fixture, requests, writes });
+    return await run({ fixture, requests, connections, writes });
   } finally {
     globalThis.fetch = previousFetch;
     delete globalThis.__artifactTestIO;
@@ -499,8 +523,33 @@ test("remote artifacts reject private addresses, private DNS answers, and redire
     fixture.responses.push(new Response(null, { status: 302, headers: { location: "https://127.0.0.1/image.png" } }));
     await assert.rejects(owners.publishRemoteMediaArtifact(remoteInput), /private network/u);
     assert.equal(requests.length, 1);
-    assert.equal(requests[0].options.redirect, "manual");
     assert.equal(writes.length, 0);
+  });
+});
+
+test("remote publication connects only to validated DNS addresses, including after redirects", async () => {
+  await withArtifactIO(async ({ fixture, connections, writes }) => {
+    const resolutions = new Map();
+    fixture.lookup = async (hostname) => {
+      const count = resolutions.get(hostname) ?? 0;
+      resolutions.set(hostname, count + 1);
+      // A second resolution at connection time would reach the attacker's private target.
+      return count > 0
+        ? [{ address: "169.254.169.254", family: 4 }]
+        : hostname === "media.example"
+          ? [{ address: "8.8.8.8", family: 4 }]
+          : [{ address: "2606:4700:4700::1111", family: 6 }];
+    };
+    fixture.responses.push(
+      new Response(null, { status: 302, headers: { location: "https://cdn.example/chart.png" } }),
+      new Response(png, { headers: { "content-type": "image/png" } }),
+    );
+    await owners.publishRemoteMediaArtifact(remoteInput);
+    assert.deepEqual(connections, [
+      { hostname: "media.example", address: "8.8.8.8" },
+      { hostname: "cdn.example", address: "2606:4700:4700::1111" },
+    ]);
+    assert.equal(writes.length, 2);
   });
 });
 

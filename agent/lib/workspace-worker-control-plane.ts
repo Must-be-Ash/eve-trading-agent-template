@@ -226,18 +226,9 @@ async function completeMonitorCheckpoint(
   }, input.client);
 }
 
-/*
- * Delivery resolves an outcome's alert by finding id, and `stageWorkspaceAlert`
- * writes a keyed alert under a digest of the finding AND the key - a key
- * `readWorkspaceAlert` cannot reproduce. The first presentation therefore has
- * to stay unkeyed so it is the record delivery can find; the rest are keyed so
- * several presentations for one finding stay distinct in the record and stay
- * addressable by id for Discuss.
- *
- * Both commit paths shared this rule by copy, which is how one of them could
- * have drifted silently. It lives here once so a seam test can exercise the
- * same code the worker runs.
- */
+// Preserve the base alert identity for the first presentation and give every
+// additional presentation a stable identity. The store indexes all of them for
+// direct delivery and bounded retries after the occurrence checkpoint advances.
 export async function stageWorkspaceAlertPresentations(input: {
   alertPresentation?: { title: string; whyMatched: string };
   alertPresentations?: readonly { artifactRefs?: readonly string[]; key: string; title: string; whyMatched: string }[];
@@ -324,20 +315,6 @@ export async function commitDeterministicWorkspaceEvaluationForWorker(input: {
     if (!outcome.finding) {
       throw new WorkspaceWorkerCommitError("workspace_worker_run_stale");
     }
-    /*
-     * Delivery resolves an outcome's alert by finding, and a staged alert is
-     * addressable that way only when it carries no presentation key: a keyed
-     * alert is written under a digest of the finding and the key together.
-     * Keying every presentation therefore made every alert with more than a
-     * bare presentation undeliverable - the commentary vertical always supplies
-     * presentations, so no commentary alert could ever be read back and every
-     * occurrence that produced one failed as workspace_alert_unavailable after
-     * committing its finding.
-     *
-     * Stage the first presentation unkeyed so it is the one delivery finds, and
-     * key the rest so several presentations for one finding stay distinct in
-     * the record without colliding.
-     */
     await stageWorkspaceAlertPresentations({
       ...(input.alertPresentation ? { alertPresentation: input.alertPresentation } : {}),
       ...(input.alertPresentations ? { alertPresentations: input.alertPresentations } : {}),

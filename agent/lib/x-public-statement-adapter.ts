@@ -47,8 +47,6 @@ import {
   appendXPublicStatementPaginationContinuation,
   clearXPublicStatementPaginationContinuation,
   readXPublicStatementPaginationContinuation,
-  readXPublicStatementWindowLowerBound,
-  pinXPublicStatementWindowLowerBound,
   readXPublicStatementPaginationItems,
   type XPublicStatementPaginationItem,
 } from "./x-public-statement-pagination-store";
@@ -216,6 +214,7 @@ export function createXPublicStatementFetch(options: {
  */
 export function createXTimelineRequest(input: {
   readonly excludeReplies?: boolean;
+  readonly endAt?: string;
   readonly fallbackStartAt?: string | null;
   readonly firstRunStartAt?: string | null;
   readonly paginationToken?: string;
@@ -228,27 +227,21 @@ export function createXTimelineRequest(input: {
   url.searchParams.set("expansions", "author_id,edit_history_tweet_ids,in_reply_to_user_id,referenced_tweets.id");
   url.searchParams.set("max_results", "100");
   url.searchParams.set("tweet.fields", "author_id,conversation_id,created_at,edit_controls,edit_history_tweet_ids,entities,in_reply_to_user_id,referenced_tweets,text,withheld");
-  if (input.firstRunStartAt) {
-    const start = new Date(input.firstRunStartAt);
-    if (!Number.isFinite(start.getTime()) || start.toISOString() !== input.firstRunStartAt) {
-      throw new Error("x_start_time_invalid");
+  // The account-wide cursor is acquisition metadata, not any one session's
+  // delivery position. Every independent window must acquire its own coverage.
+  const startAt = input.firstRunStartAt ?? input.fallbackStartAt;
+  if (!startAt) throw new Error("x_timeline_request_unbounded");
+  const start = new Date(startAt);
+  if (!Number.isFinite(start.getTime()) || start.toISOString() !== startAt) {
+    throw new Error("x_start_time_invalid");
+  }
+  url.searchParams.set("start_time", startAt);
+  if (input.endAt) {
+    const end = new Date(input.endAt);
+    if (!Number.isFinite(end.getTime()) || end.toISOString() !== input.endAt || end <= start) {
+      throw new Error("x_end_time_invalid");
     }
-    url.searchParams.set("start_time", input.firstRunStartAt);
-  } else if (source.cursor.revision > 0) {
-    if (source.cursor.watermark === null) throw new Error("x_since_id_missing");
-    url.searchParams.set("since_id", source.cursor.watermark);
-  } else if (input.fallbackStartAt) {
-    /*
-     * Neither an owner-configured backfill nor an advanced cursor, which is the
-     * state an occurrence that failed before committing leaves behind. Bound the
-     * request to the evaluation window anyway. This is deliberately only a
-     * request bound: it does not enter the request variant digest, and it does
-     * not make this a lookback or suppress baseline establishment, because those
-     * describe what the occurrence is doing, not how the URL is limited.
-     */
-    url.searchParams.set("start_time", input.fallbackStartAt);
-  } else {
-    throw new Error("x_timeline_request_unbounded");
+    url.searchParams.set("end_time", input.endAt);
   }
   if (input.paginationToken) url.searchParams.set("pagination_token", input.paginationToken);
   return Object.freeze({ kind: "timeline", url: url.toString() });
@@ -259,9 +252,9 @@ function xTimelineRequestVariantDigest(input: {
   readonly firstRunStartAt: string | null;
 }): string {
   return digestPublicSourceValue([
-    "x-public-statements-timeline-request",
+    "x-public-statements-timeline-window-request-v2",
     input.firstRunStartAt === null
-      ? { excludeReplies: input.excludeReplies, mode: "cursor" }
+      ? { excludeReplies: input.excludeReplies, mode: "window" }
       : { excludeReplies: input.excludeReplies, mode: "lookback", startAt: input.firstRunStartAt },
   ]);
 }
@@ -472,12 +465,21 @@ async function canonicalFact(input: {
     stableRowIdentity: "statement",
   };
   const logicalKey = deriveCanonicalPublicFactLogicalKey(base);
-  const fact = canonicalPublicFactRevisionSchema.parse({
+  let fact = canonicalPublicFactRevisionSchema.parse({
     ...base,
     logicalKey,
     revisionId: deriveCanonicalPublicFactRevisionId({ logicalKey, payloadDigest }),
   });
   const previous = await readLatestPublicSourceFactRevision(logicalKey, input.client);
+  if (previous?.payload.schemaVersion === "public-statement/v1") {
+    const previousStatement = publicStatementSchema.parse(previous.payload.statement);
+    const unchangedPayload = {
+      ...payload,
+      statement: { ...payload.statement, observedAt: previousStatement.observedAt },
+    };
+    // Re-observing unchanged content in an overlapping window is not an edit.
+    if (digestPublicSourceValue(unchangedPayload) === previous.payloadDigest) fact = previous;
+  }
   const correction = previous && previous.revisionId !== fact.revisionId
     ? publicSourceCorrectionSchema.parse({
         correctionId: `correction.${digestPublicSourceValue([
@@ -884,31 +886,16 @@ export async function runSharedXPublicStatementAcquisition(input: {
   readonly window: { readonly endAt: string; readonly startAt: string };
 }): Promise<SharedXPublicStatementAcquisitionResult> {
   const reviewed = resolveReviewedPublicSource(input.sourceId);
-  const requestedFirstRunStartAt = input.firstRunStartAt ?? null;
+  const firstRunStartAt = input.firstRunStartAt ?? null;
   const sourceInstance = await ensurePublicSourceInstance(reviewed.sourceInstance, input.client);
-  let continuation = await readXPublicStatementPaginationContinuation(
-    sourceInstance.sourceInstanceId,
-    input.evidence.client,
-  );
-  if (continuation && continuation.expectedCursorRevision !== sourceInstance.cursor.revision) {
-    await clearXPublicStatementPaginationContinuation(continuation, input.evidence.client);
-    continuation = null;
-  }
   const excludeReplies = input.excludeReplies ?? true;
-  if (continuation && (continuation.excludeReplies ?? true) !== excludeReplies) {
-    await clearXPublicStatementPaginationContinuation(continuation, input.evidence.client);
-    continuation = null;
-  }
-  // A bounded first-run page chain may finish in a later scheduled occurrence.
-  // Resume the durable chain with its original lower bound instead of treating
-  // the new occurrence's cursor-mode request as incompatible.
-  const requestIdentity = { excludeReplies, requestedFirstRunStartAt, sourceInstanceId: sourceInstance.sourceInstanceId, window: input.window };
-  const pinnedLowerBound = await readXPublicStatementWindowLowerBound(requestIdentity, input.evidence.client);
-  const firstRunStartAt = pinnedLowerBound ?? continuation?.firstRunStartAt ?? requestedFirstRunStartAt;
-  if (firstRunStartAt !== null && firstRunStartAt !== requestedFirstRunStartAt) {
-    await pinXPublicStatementWindowLowerBound({ ...requestIdentity, firstRunStartAt }, input.evidence.client);
-  }
   const requestVariantDigest = xTimelineRequestVariantDigest({ excludeReplies, firstRunStartAt });
+  const requestIdentity = {
+    excludeReplies,
+    firstRunStartAt,
+    sourceInstanceId: sourceInstance.sourceInstanceId,
+    window: input.window,
+  };
   const committedForWindow = await readCommittedPublicSourceAcquisitionForWindow({
     accessClassification: "public",
     adapterDefinitionDigest: reviewed.sourceInstance.adapterDefinitionDigest,
@@ -926,6 +913,11 @@ export async function runSharedXPublicStatementAcquisition(input: {
       reused: true,
       statements: await statementsForRevisionIds(committedForWindow.result.candidateFactRevisionIds, input.client),
     });
+  }
+  let continuation = await readXPublicStatementPaginationContinuation(requestIdentity, input.evidence.client);
+  if (continuation && continuation.expectedCursorRevision !== sourceInstance.cursor.revision) {
+    // Keep the paid page chain for inspection; never discard it and buy it again.
+    throw new Error("x_pagination_continuation_stale");
   }
   const eligibility = {
     accessClassification: "public" as const,
@@ -958,6 +950,7 @@ export async function runSharedXPublicStatementAcquisition(input: {
       for (let page = 0; page < xConfiguration(sourceInstance).maximumPagesPerPoll; page += 1) {
         const response = await input.fetchResponse(createXTimelineRequest({
           excludeReplies,
+          endAt: input.window.endAt,
           fallbackStartAt: input.window.startAt,
           firstRunStartAt,
           paginationToken,
@@ -1000,14 +993,12 @@ export async function runSharedXPublicStatementAcquisition(input: {
           sourceInstance,
         });
         continuation = await appendXPublicStatementPaginationContinuation({
-          excludeReplies,
+          ...requestIdentity,
           expectedCursorRevision: sourceInstance.cursor.revision,
-          firstRunStartAt,
           items: normalized,
           nextToken,
           pagesRead: responses.length,
           postsRead,
-          sourceInstanceId: sourceInstance.sourceInstanceId,
         }, input.evidence.client);
         const failure = errorAcquisition({
           code: "pagination_bounds_exceeded",

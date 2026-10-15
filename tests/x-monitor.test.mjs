@@ -96,19 +96,32 @@ test("X requests are bounded and paid multi-page continuation resumes without re
   assert.equal(first.statements.length, 0);
   assert.equal(first.receipt.billablePostReads, 2);
   const nextWindow = { startAt: window.endAt, endAt: "2026-01-01T12:20:00.000Z" };
-  const complete = await api.runSharedXPublicStatementAcquisition({ client: store, evidence: evidence(store), fetchResponse, sourceId: SOURCE_ID, window: nextWindow });
+  const other = await api.runSharedXPublicStatementAcquisition({ client: store, evidence: evidence(store), sourceId: SOURCE_ID, window: nextWindow, fetchResponse: async request => {
+    assert.equal(new URL(request.url).searchParams.get("pagination_token"), null, "a different window cannot consume another window's paid continuation");
+    return response(request, [], {}, 429);
+  } });
+  assert.equal(other.acquisition.errorCode, "rate_limit_exhausted");
+  const complete = await api.runSharedXPublicStatementAcquisition({ client: store, evidence: evidence(store), fetchResponse, firstRunStartAt: window.startAt, sourceId: SOURCE_ID, window });
   assert.equal(complete.acquisition.status, "complete");
   assert.equal(complete.statements.length, 3);
   assert.equal(complete.receipt.billablePostReads, 1);
   assert.deepEqual(requests, [null, "second", "third"]);
   assert.equal((await api.readPublicSourceInstance(source.sourceInstance.sourceInstanceId, store)).cursor.watermark, "102");
-  const replay = await api.runSharedXPublicStatementAcquisition({ client: store, evidence: evidence(store), fetchResponse: async () => { throw new Error("must not refetch committed acquisition"); }, sourceId: SOURCE_ID, window: nextWindow });
+  const replay = await api.runSharedXPublicStatementAcquisition({ client: store, evidence: evidence(store), fetchResponse: async () => { throw new Error("must not refetch committed acquisition"); }, firstRunStartAt: window.startAt, sourceId: SOURCE_ID, window });
   assert.equal(replay.reused, true);
   assert.equal(replay.acquisition.acquisitionId, complete.acquisition.acquisitionId);
   assert.ok(!JSON.stringify(complete).includes("Fixture market statement."));
+  const pendingWindow = { startAt: nextWindow.endAt, endAt: "2026-01-01T12:30:00.000Z" };
+  await api.runSharedXPublicStatementAcquisition({ client: store, evidence: evidence(store), sourceId: SOURCE_ID, window: pendingWindow, fetchResponse: async request => response(request, [post("103")], { next_token: "pending" }) });
+  await api.runSharedXPublicStatementAcquisition({ client: store, evidence: evidence(store), sourceId: SOURCE_ID, window: { startAt: pendingWindow.endAt, endAt: "2026-01-01T12:40:00.000Z" }, fetchResponse: async request => response(request, []) });
+  let repeatedPaidReads = 0;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await assert.rejects(api.runSharedXPublicStatementAcquisition({ client: store, evidence: evidence(store), sourceId: SOURCE_ID, window: pendingWindow, fetchResponse: async () => { repeatedPaidReads++; throw new Error("stale paid pages must be retained"); } }), /x_pagination_continuation_stale/);
+  }
+  assert.equal(repeatedPaidReads, 0);
 });
 
-test("X acquisition projects only into its authorized session and encrypted evidence can be revoked", async () => {
+test("X windows reach each authorized session independently and encrypted evidence can be revoked", async () => {
   const store = new Store(); const workspaceId = "123e4567-e89b-42d3-a456-426614174201";
   const scope = api.authorizeDeploymentWorkspaceStore({ ownerId: "owner_fixture", workspaceId }, { EVE_DEPLOYMENT_OWNER_ID: "owner_fixture" });
   const otherScope = api.authorizeDeploymentWorkspaceStore({ ownerId: "owner_fixture", workspaceId: "123e4567-e89b-42d3-a456-426614174202" }, { EVE_DEPLOYMENT_OWNER_ID: "owner_fixture" });
@@ -120,6 +133,42 @@ test("X acquisition projects only into its authorized session and encrypted evid
   assert.equal(result.projection.projections.length, 1);
   assert.equal(result.projection.projections[0].projection.workspaceId, workspaceId);
   await assert.rejects(api.coordinatePublicSourceOccurrence({ ...input, scope: otherScope }), /public_source_reference_invalid/);
+  const otherMonitor = { ...monitor, workspaceId: otherScope.workspaceId, publicSourceSubscriptions: [api.resolvePublicSourceWorkspaceReference({ monitorId, sourceId: SOURCE_ID, workspaceId: otherScope.workspaceId })] };
+  const baselineB = await api.coordinatePublicSourceOccurrence({ ...input, monitor: otherMonitor, scope: otherScope, fetch: { ...input.fetch, fetchResponse: async () => { throw new Error("identical windows must share their committed acquisition"); } } });
+  assert.equal(baselineB.projection.projections[0].fact.revisionId, result.projection.projections[0].fact.revisionId);
+  const posts = [
+    { ...post("200"), created_at: "2026-01-01T12:15:00.000Z" },
+    { ...post("300"), created_at: "2026-01-01T12:25:00.000Z" },
+  ];
+  let reads = 0;
+  const fetchWindow = endAt => ({ ...input.fetch, firstRunStartAt: null, fetchResponse: async request => {
+    reads++;
+    const query = new URL(request.url).searchParams;
+    const data = posts.filter(item =>
+      (!query.has("since_id") || BigInt(item.id) > BigInt(query.get("since_id"))) &&
+      (!query.has("start_time") || item.created_at >= query.get("start_time")) &&
+      item.created_at < endAt &&
+      (!query.has("end_time") || item.created_at < query.get("end_time")));
+    return { ...response(request, data), observedAt: endAt };
+  } });
+  const fastWindow = { startAt: window.endAt, endAt: "2026-01-01T12:20:00.000Z" };
+  const slowWindow = { startAt: window.endAt, endAt: "2026-01-01T12:30:00.000Z" };
+  const fast = await api.coordinatePublicSourceOccurrence({ ...input, fetch: fetchWindow(fastWindow.endAt), window: fastWindow });
+  const slow = await api.coordinatePublicSourceOccurrence({ ...input, monitor: otherMonitor, scope: otherScope, fetch: fetchWindow(slowWindow.endAt), window: slowWindow });
+  const ids = outcome => outcome.projection.projections.map(({ fact }) => fact.payload.statement.stablePostId);
+  assert.deepEqual(ids(fast), ["200"]);
+  assert.deepEqual(ids(slow), ["200", "300"], "another session's cursor must not consume this session's window");
+  assert.equal(slow.projection.projections[0].fact.revisionId, fast.projection.projections[0].fact.revisionId, "an unchanged public post is one canonical revision across observations");
+  assert.ok(slow.projection.projections.every(({ projection }) => projection.workspaceId === otherScope.workspaceId));
+  assert.equal(slow.acquisition.coverage, "complete");
+  const slowReplay = await api.coordinatePublicSourceOccurrence({ ...input, monitor: otherMonitor, scope: otherScope, fetch: fetchWindow(slowWindow.endAt), window: slowWindow });
+  assert.deepEqual(ids(slowReplay), ["200", "300"]);
+  assert.equal(reads, 2, "replaying a committed window never repeats paid reads");
+  const catchUpWindow = { startAt: fastWindow.endAt, endAt: slowWindow.endAt };
+  const catchUp = await api.coordinatePublicSourceOccurrence({ ...input, fetch: fetchWindow(catchUpWindow.endAt), window: catchUpWindow });
+  assert.deepEqual(ids(catchUp), ["300"]);
+  assert.equal(catchUp.projection.projections[0].fact.revisionId, slow.projection.projections[1].fact.revisionId);
+  assert.deepEqual([...ids(fast), ...ids(catchUp)], ids(slow), "both cadences evaluate each relevant post exactly once");
   const fact = result.projection.projections[0].fact;
   const envelopeId = fact.payload.statement.contentReference.envelopeId;
   const envelope = await api.readRevocableEvidenceEnvelope(envelopeId, store);

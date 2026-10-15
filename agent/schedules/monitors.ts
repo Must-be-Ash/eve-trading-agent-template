@@ -25,7 +25,7 @@ import {
   type WorkspaceRuntimeObservationSink,
 } from "../lib/workspace-runtime-observability";
 import { recoverWorkspaceRunForControlPlane } from "../lib/workspace-worker-recovery";
-import { deliverWorkspaceOutcomeToPhoton } from "../lib/workspace-alert-dispatch";
+import { deliverWorkspaceOutcomeToPhoton, retryPendingWorkspaceAlertsToPhoton } from "../lib/workspace-alert-dispatch";
 import {
   prepareWorkspaceWorkerRecovery,
   prepareWorkspaceWorkerRun,
@@ -34,6 +34,7 @@ import {
 
 export interface WorkspaceMonitorScheduleDependencies {
   readonly claimWorkspaceMonitors: typeof claimDueWorkspaceMonitors;
+  readonly retryWorkspaceAlerts: typeof retryPendingWorkspaceAlertsToPhoton;
   readonly deliverWorkspaceOutcome: typeof deliverWorkspaceOutcomeToPhoton;
   readonly deferWorkspaceBudget: typeof deferWorkspaceMonitorForBudget;
   readonly emitRuntimeObservation: WorkspaceRuntimeObservationSink;
@@ -55,6 +56,7 @@ export interface WorkspaceMonitorScheduleDependencies {
 const productionDependencies: WorkspaceMonitorScheduleDependencies = Object.freeze({
   claimWorkspaceMonitors: claimDueWorkspaceMonitors,
   deliverWorkspaceOutcome: deliverWorkspaceOutcomeToPhoton,
+  retryWorkspaceAlerts: retryPendingWorkspaceAlertsToPhoton,
   deferWorkspaceBudget: deferWorkspaceMonitorForBudget,
   emitRuntimeObservation: emitWorkspaceRuntimeObservation,
   finishWorkspaceBudget: finishWorkspaceMonitorDispatchBudget,
@@ -451,6 +453,28 @@ async function executeWorkspaceJob(
       errorCode: safeWorkspaceRuntimeErrorCode(error, "evaluation_failed"),
       value: 1,
     });
+    // A completed budget release proves preparation never reached the evaluator.
+    // Persist that proof before making the occurrence claimable again.
+    if (!started) {
+      await dependencies.finishWorkspaceBudget(job, budget, { outcome: "released" });
+      await dependencies.recordWorkspaceFailure({
+        errorCode: "worker_preparation_failed",
+        expectedRevision: job.monitor.configurationRevision,
+        monitorId: job.monitor.monitorId,
+        scope: job.scope,
+      });
+      await dependencies.releaseWorkspaceLease({
+        leaseToken: job.leaseToken,
+        monitorId: job.monitor.monitorId,
+        retryAt: new Date(dependencies.now().getTime() + 60_000).toISOString(),
+        retryableBeforeExecution: {
+          occurrenceKey: job.occurrence.occurrenceKey,
+          leaseTokenDigest: job.occurrence.leaseTokenDigest,
+        },
+        scope: job.scope,
+      });
+      return;
+    }
     if (started) {
       try {
         await dependencies.recordWorkspaceFailure({
@@ -506,6 +530,11 @@ export function createWorkspaceMonitorSchedule(
         const now = dependencies.now();
         const flags = dependencies.resolveRuntimeFlags();
         const scheduleFailures: WorkspaceRuntimeErrorCode[] = [];
+        if (flags.dispatch && flags.photonAlerts) {
+          collectScheduleFailures(scheduleFailures, await Promise.allSettled([
+            dependencies.retryWorkspaceAlerts({ now }),
+          ]), "schedule_job_failed");
+        }
         const [workspaceClaim] = await Promise.allSettled([
           flags.dispatch
             ? dependencies.claimWorkspaceMonitors({
@@ -540,9 +569,9 @@ export function createWorkspaceMonitorSchedule(
             value: workspaceJobs.length,
           });
         }
-        const recoveryJobs = workspaceJobs.filter(({ occurrence }) => occurrence.attempt > 1);
+        const recoveryJobs = workspaceJobs.filter(({ occurrence }) => occurrence.attempt > 1 && !occurrence.retryableBeforeExecution);
         const firstAttemptJobs = workspaceJobs.filter(
-          (job) => job.occurrence.attempt === 1,
+          (job) => job.occurrence.attempt === 1 || job.occurrence.retryableBeforeExecution === true,
         );
         collectScheduleFailures(
           scheduleFailures,

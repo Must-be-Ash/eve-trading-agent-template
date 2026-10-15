@@ -82,10 +82,12 @@ local active_lease = redis.call("GET", KEYS[2])
 if active_lease then return {"leased"} end
 local occurrence_raw = redis.call("GET", KEYS[3])
 local attempt = 1
+local retryable_before_execution = false
 if occurrence_raw then
   local occurrence_ok, occurrence = pcall(cjson.decode, occurrence_raw)
   if not occurrence_ok or occurrence.status ~= "leased" then return {"duplicate"} end
   attempt = tonumber(occurrence.attempt) + 1
+  retryable_before_execution = occurrence.retryableBeforeExecution == true
 end
 local acquired = redis.call("SET", KEYS[2], ARGV[4], "NX", "PX", ARGV[5])
 if not acquired then return {"leased"} end
@@ -104,16 +106,31 @@ local occurrence = {
 redis.call("SET", KEYS[3], cjson.encode(occurrence), "EX", ARGV[12])
 redis.call("ZREM", KEYS[4], KEYS[1])
 redis.call("ZADD", KEYS[5], ARGV[13], KEYS[1])
-return {"claimed", tostring(attempt)}
+return {"claimed", tostring(attempt), retryable_before_execution and "1" or "0"}
 `;
 const RELEASE_LEASE_SCRIPT = `
 if redis.call("GET", KEYS[1]) ~= ARGV[1] then return 0 end
+if ARGV[3] ~= "" then
+  local raw = redis.call("GET", KEYS[5])
+  if not raw then return 0 end
+  local ok, occurrence = pcall(cjson.decode, raw)
+  if not ok or occurrence.status ~= "leased" or occurrence.leaseTokenDigest ~= ARGV[3] then return 0 end
+  occurrence.retryableBeforeExecution = true
+  redis.call("SET", KEYS[5], cjson.encode(occurrence), "KEEPTTL")
+end
 redis.call("DEL", KEYS[1])
 redis.call("ZREM", KEYS[4], KEYS[2])
 local raw = redis.call("GET", KEYS[2])
 if raw then
   local ok, record = pcall(cjson.decode, raw)
   if ok and record.lifecycleState == "enabled" and record.nextOccurrenceAt and ARGV[2] ~= "" then
+    if ARGV[3] ~= "" then
+      local occurrence = cjson.decode(redis.call("GET", KEYS[5]))
+      if tonumber(record.configurationRevision) == tonumber(occurrence.configurationRevision) then
+        record.preparationRetry = {occurrenceIdentity = occurrence.occurrenceIdentity, scheduledFor = occurrence.scheduledFor}
+        redis.call("SET", KEYS[2], cjson.encode(record))
+      end
+    end
     redis.call("ZADD", KEYS[3], ARGV[2], KEYS[2])
   end
 end
@@ -270,6 +287,10 @@ const monitorSchema = z
       })
       .strict(),
     sourceContinuationAt: timestampSchema.nullable().optional(),
+    preparationRetry: z.object({
+      occurrenceIdentity: z.string().min(1).max(160),
+      scheduledFor: timestampSchema,
+    }).strict().nullable().optional(),
     sources: workspaceMonitorSourcesSchema.or(z.tuple([])),
     tighteningLimits: z
       .object({
@@ -327,6 +348,7 @@ const monitorSchema = z
 const occurrenceSchema = z
   .object({
     attempt: z.number().int().positive(),
+    retryableBeforeExecution: z.boolean().optional(),
     configurationRevision: z.number().int().positive(),
     leaseTokenDigest: z.string().regex(/^[a-f0-9]{64}$/u),
     monitorId: z.string().uuid(),
@@ -403,7 +425,7 @@ export interface WorkspaceMonitorStoreClient {
     recordKey: string;
     scheduledFor: string;
     updatedAt: string;
-  }): Promise<{ attempt?: number; status: "claimed" | "duplicate" | "leased" | "missing" | "not_due" | "stale" }>;
+  }): Promise<{ attempt?: number; retryableBeforeExecution?: boolean; status: "claimed" | "duplicate" | "leased" | "missing" | "not_due" | "stale" }>;
   create(input: {
     dueAtMs: number | null;
     dueKey: string;
@@ -420,6 +442,8 @@ export interface WorkspaceMonitorStoreClient {
     nowMs: number;
   }): Promise<{ raw: unknown; recordKey: string }[]>;
   releaseLease(input: {
+    occurrenceRecordKey?: string;
+    leaseTokenDigest?: string;
     dueAtMs: number | null;
     dueKey: string;
     inflightKey: string;
@@ -518,7 +542,7 @@ function store(): WorkspaceMonitorStoreClient {
         ],
       );
       return result[0] === "claimed"
-        ? { attempt: Number(result[1]), status: "claimed" as const }
+        ? { attempt: Number(result[1]), retryableBeforeExecution: result[2] === "1", status: "claimed" as const }
         : { status: result[0] as Exclude<Awaited<ReturnType<WorkspaceMonitorStoreClient["claim"]>>["status"], "claimed"> };
     },
     async create(input) {
@@ -559,12 +583,13 @@ function store(): WorkspaceMonitorStoreClient {
     },
     async releaseLease(input) {
       return (
-        (await redisClient!.eval<[string, string], number>(
+        (await redisClient!.eval<[string, string, string], number>(
           RELEASE_LEASE_SCRIPT,
-          [input.leaseKey, input.recordKey, input.dueKey, input.inflightKey],
+          [input.leaseKey, input.recordKey, input.dueKey, input.inflightKey, ...(input.occurrenceRecordKey ? [input.occurrenceRecordKey] : [])],
           [
             input.leaseToken,
             input.dueAtMs === null ? "" : String(input.dueAtMs),
+            input.leaseTokenDigest ?? "",
           ],
         )) === 1
       );
@@ -747,7 +772,9 @@ export async function claimDueWorkspaceMonitors(
       });
       continue;
     }
-    const selection = selectWorkspaceMonitorDueOccurrence({
+    const selection = monitor.preparationRetry
+      ? { due: { occurrenceIdentity: monitor.preparationRetry.occurrenceIdentity, scheduledAt: monitor.preparationRetry.scheduledFor }, skipped: [], skippedBefore: null }
+      : selectWorkspaceMonitorDueOccurrence({
       sourceContinuationAt: monitor.sourceContinuationAt ?? undefined,
       ...(isWorkspaceMonitorCheckpointOnlyBaseline(monitor) &&
           resolveManagedMonitorLifecycleContract(monitor)?.initialOccurrence === "immediate" &&
@@ -824,6 +851,7 @@ export async function claimDueWorkspaceMonitors(
         monitor,
         occurrence: occurrenceSchema.parse({
           attempt: result.attempt,
+          retryableBeforeExecution: result.retryableBeforeExecution === true,
           configurationRevision: monitor.configurationRevision,
           leaseTokenDigest: createHash("sha256").update(leaseToken).digest("hex"),
           monitorId: monitor.monitorId,
@@ -1289,6 +1317,7 @@ export async function updateWorkspaceMonitor(
   const next = monitorSchema.safeParse({
     ...current,
     ...input.patch,
+    preparationRetry: null,
     ...(current.sourceContinuationAt &&
         (input.patch.schedule !== undefined || input.patch.nextOccurrenceAt !== undefined || targetLifecycle !== "enabled")
       ? { sourceContinuationAt: null }
@@ -1435,6 +1464,7 @@ export async function claimWorkspaceMonitorOccurrence(
     leaseToken,
     occurrence: occurrenceSchema.parse({
       attempt: result.attempt,
+      retryableBeforeExecution: result.retryableBeforeExecution === true,
       configurationRevision: input.configurationRevision,
       leaseTokenDigest: createHash("sha256").update(leaseToken).digest("hex"),
       monitorId: input.monitorId,
@@ -1615,6 +1645,7 @@ export async function releaseWorkspaceMonitorLease(
     leaseToken: string;
     monitorId: string;
     retryAt?: string;
+    retryableBeforeExecution?: { occurrenceKey: string; leaseTokenDigest: string };
     scope: AuthorizedWorkspaceStoreScope;
   },
   client: WorkspaceMonitorStoreClient = store(),
@@ -1626,7 +1657,13 @@ export async function releaseWorkspaceMonitorLease(
   if (retryAtMs !== null && !Number.isFinite(retryAtMs)) {
     throw new WorkspaceMonitorError("monitor_invalid");
   }
+  const retry = input.retryableBeforeExecution;
+  if (retry && (!/^[a-f0-9]{64}$/u.test(retry.occurrenceKey) ||
+    !/^[a-f0-9]{64}$/u.test(retry.leaseTokenDigest))) {
+    throw new WorkspaceMonitorError("monitor_invalid");
+  }
   return client.releaseLease({
+    ...(retry ? { occurrenceRecordKey: `${OCCURRENCE_PREFIX}${retry.occurrenceKey}`, leaseTokenDigest: retry.leaseTokenDigest } : {}),
     dueAtMs: retryAtMs ?? dueAt(monitor),
     dueKey: DUE_KEY,
     inflightKey: INFLIGHT_KEY,
@@ -1739,6 +1776,7 @@ export async function completeWorkspaceMonitorCheckpoint(
   const nextMonitor = monitorSchema.parse({
     ...expectedMonitor,
     consecutiveFailures: 0,
+    preparationRetry: null,
     lastCompletedAt: completedAt,
     lastErrorCode: null,
     lastRunAt: completedAt,
