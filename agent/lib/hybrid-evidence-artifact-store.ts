@@ -19,6 +19,7 @@ const MAX_INDEX_BYTES = 512 * 1_024;
 const MAX_ARTIFACTS = 1_024;
 const QUARANTINE_RETENTION_MS = 90 * 24 * 60 * 60_000;
 const ORPHAN_RETENTION_MS = 30 * 24 * 60 * 60_000;
+const MAX_TRANSIENT_REFERENCE_MS = 60 * 60_000;
 const CAS_SCRIPT = `
 local current = redis.call("GET", KEYS[1])
 if ARGV[1] == "" then
@@ -32,9 +33,11 @@ return 1
 
 const referenceSchema = z.object({
   active: z.boolean(),
-  kind: z.enum(["accepted_result", "current_lineage", "promotion"]),
+  expiresAt: z.string().datetime({ offset: true }).nullable().default(null),
+  kind: z.enum(["accepted_result", "current_lineage", "promotion", "transient"]),
   referenceId: z.string().min(3).max(200),
-}).strict();
+}).strict().refine((reference) =>
+  (reference.kind === "transient") === (reference.expiresAt !== null));
 const artifactEntrySchema = z.object({
   deletionToken: z.string().regex(/^[a-f0-9]{64}$/u).nullable().default(null),
   manifest: evidenceArtifactManifestSchema,
@@ -55,6 +58,12 @@ const indexSchema = z.object({
 }).strict();
 
 type ArtifactIndex = z.infer<typeof indexSchema>;
+
+function activeReference(reference: z.infer<typeof referenceSchema>, now: Date): boolean {
+  return reference.active && (
+    reference.expiresAt === null || Date.parse(reference.expiresAt) > now.getTime()
+  );
+}
 
 export interface HybridEvidenceArtifactIndexClient {
   compareAndSet(key: string, expected: string | null, next: string): Promise<boolean>;
@@ -86,7 +95,7 @@ export interface HybridEvidenceArtifactStore {
   setReference(input: {
     active: boolean;
     artifactDigest: string;
-    kind: "accepted_result" | "current_lineage" | "promotion";
+    kind: "accepted_result" | "current_lineage" | "promotion" | "transient";
     referenceId: string;
   }): Promise<void>;
   setRetention(input: {
@@ -115,6 +124,8 @@ export interface PersistHybridEvidenceArtifactInput {
   readonly parserEligibility: EvidenceArtifactManifest["parserEligibility"];
   readonly sourceInstanceId: string;
   readonly structure: EvidenceArtifactManifest["structure"];
+  /** Acquired atomically with persistence; release with setReference after use. */
+  readonly transientReference?: { readonly expiresAt: string; readonly referenceId: string };
 }
 
 export interface HybridEvidenceSlice {
@@ -390,9 +401,11 @@ export function createHybridEvidenceArtifactStore(options: {
       const claimed = await updateIndex(indexClient, indexKey, (current) => {
         const removable = current.artifacts.filter(({ deletionToken, manifest, references }) =>
           !deletionToken &&
-          references.every(({ active }) => !active) &&
-          manifest.retention.expiresAt !== null &&
-          Date.parse(manifest.retention.expiresAt) <= now.getTime()
+          references.every((reference) => !activeReference(reference, now)) &&
+          ((manifest.retention.expiresAt !== null &&
+            Date.parse(manifest.retention.expiresAt) <= now.getTime()) ||
+            (!retainAcceptedResultReferences && references.some((reference) =>
+              reference.kind === "transient" && Date.parse(reference.expiresAt!) <= now.getTime())))
         );
         const claims = removable.map(({ manifest }) => ({
           digest: manifest.contentDigest,
@@ -464,13 +477,14 @@ export function createHybridEvidenceArtifactStore(options: {
     },
 
     async deleteUnreferenced(artifactDigest: string) {
-      const token = digestHybridEvidenceValue(["artifact-delete-now", artifactDigest, Date.now()]);
+      const now = new Date();
+      const token = digestHybridEvidenceValue(["artifact-delete-now", artifactDigest, now.getTime()]);
       const claimed = await updateIndex(indexClient, indexKey, (current) => {
         const index = current.artifacts.findIndex(({ manifest }) =>
           manifest.contentDigest === artifactDigest);
         if (index < 0) return { index: current, result: null };
         const entry = current.artifacts[index]!;
-        if (entry.deletionToken || entry.references.some(({ active }) => active)) {
+        if (entry.deletionToken || entry.references.some((reference) => activeReference(reference, now))) {
           return { index: current, result: null };
         }
         const artifacts = [...current.artifacts];
@@ -522,6 +536,20 @@ export function createHybridEvidenceArtifactStore(options: {
         throw new HybridEvidenceArtifactStoreError("artifact_bounds_exceeded");
       }
       assertArtifactShape(input);
+      // Occurrence timestamps can be old after recovery; borrowing uses wall time.
+      const referenceNow = new Date();
+      const transientReference = input.transientReference === undefined ? null : referenceSchema.parse({
+        ...input.transientReference,
+        active: true,
+        kind: "transient",
+      });
+      if (transientReference && (
+        Date.parse(transientReference.expiresAt!) <= referenceNow.getTime() ||
+        Date.parse(transientReference.expiresAt!) > referenceNow.getTime() + MAX_TRANSIENT_REFERENCE_MS
+      )) throw new HybridEvidenceArtifactStoreError("artifact_bounds_exceeded");
+      // Reuse the existing collector so crashed private workers are reclaimed
+      // on subsequent acquisition without extending public artifact retention.
+      if (!retainAcceptedResultReferences) await artifactStore.collectExpired();
       const digest = digestBytes(input.bytes);
       const observedAt = new Date(input.observedAt);
       const now = input.now ?? new Date();
@@ -561,7 +589,21 @@ export function createHybridEvidenceArtifactStore(options: {
           ) {
             throw new HybridEvidenceArtifactStoreError("artifact_digest_mismatch");
           }
-          return { index: current, result: { created: false, manifest: existing.manifest } };
+          if (!transientReference) {
+            return { index: current, result: { created: false, manifest: existing.manifest } };
+          }
+          const references = existing.references.filter((reference) =>
+            (reference.kind !== "transient" || reference.referenceId !== transientReference.referenceId) &&
+            (retainAcceptedResultReferences || activeReference(reference, referenceNow)));
+          references.push(transientReference);
+          return {
+            index: {
+              ...current,
+              artifacts: current.artifacts.map((entry) => entry === existing ? { ...entry, references } : entry),
+              revision: current.revision + 1,
+            },
+            result: { created: false, manifest: existing.manifest },
+          };
         }
         const daily = current.usage.filter(
           (entry) => entry.calendarDay === day && entry.sourceInstanceId === null,
@@ -584,7 +626,9 @@ export function createHybridEvidenceArtifactStore(options: {
         return {
           index: {
             ...current,
-            artifacts: [...current.artifacts, { deletionToken: null, manifest, references: [] }],
+            artifacts: [...current.artifacts, {
+              deletionToken: null, manifest, references: transientReference ? [transientReference] : [],
+            }],
             revision: current.revision + 1,
             usage: [
               ...current.usage.filter((entry) => entry.calendarDay >= day),
@@ -595,31 +639,37 @@ export function createHybridEvidenceArtifactStore(options: {
           result: { created: true, manifest },
         };
       });
-      const stored = reserved.created ? null : await blobs.get(manifest.storageKey);
-      if (
-        reserved.created ||
-        stored === null ||
-        stored.byteLength !== input.bytes.byteLength ||
-        digestBytes(stored) !== digest
-      ) {
-        try {
+      try {
+        const stored = reserved.created ? null : await blobs.get(manifest.storageKey);
+        if (
+          reserved.created ||
+          stored === null ||
+          stored.byteLength !== input.bytes.byteLength ||
+          digestBytes(stored) !== digest
+        ) {
           await blobs.put(manifest.storageKey, input.bytes, input.mediaType);
-        } catch {
-          if (reserved.created) {
-            await updateIndex(indexClient, indexKey, (current) => ({
-              index: {
-                ...current,
-                artifacts: current.artifacts.filter(
-                  ({ manifest: candidate }) => candidate.contentDigest !== digest,
-                ),
-                revision: current.revision + 1,
-                usage: current.usage.filter((entry) => entry.artifactDigest !== digest),
-              },
-              result: undefined,
-            }));
-          }
-          throw new HybridEvidenceArtifactStoreError("storage_unavailable");
         }
+      } catch {
+        if (transientReference) {
+          await artifactStore.setReference({
+            active: false, artifactDigest: digest, kind: "transient",
+            referenceId: transientReference.referenceId,
+          });
+          await artifactStore.deleteUnreferenced(digest);
+        } else if (reserved.created) {
+          await updateIndex(indexClient, indexKey, (current) => ({
+            index: {
+              ...current,
+              artifacts: current.artifacts.filter(
+                ({ manifest: candidate }) => candidate.contentDigest !== digest,
+              ),
+              revision: current.revision + 1,
+              usage: current.usage.filter((entry) => entry.artifactDigest !== digest),
+            },
+            result: undefined,
+          }));
+        }
+        throw new HybridEvidenceArtifactStoreError("storage_unavailable");
       }
       return reserved.manifest;
     },
@@ -676,16 +726,27 @@ export function createHybridEvidenceArtifactStore(options: {
     async setReference(input: {
       active: boolean;
       artifactDigest: string;
-      kind: "accepted_result" | "current_lineage" | "promotion";
+      kind: "accepted_result" | "current_lineage" | "promotion" | "transient";
       referenceId: string;
     }) {
       await updateIndex(indexClient, indexKey, (current) => {
         const index = current.artifacts.findIndex(
           ({ manifest }) => manifest.contentDigest === input.artifactDigest,
         );
-        if (index < 0) throw new HybridEvidenceArtifactStoreError("artifact_not_found");
+        const releasingTransient = input.kind === "transient" && !input.active;
+        if (index < 0) {
+          if (releasingTransient) return { index: current, result: undefined };
+          throw new HybridEvidenceArtifactStoreError("artifact_not_found");
+        }
         const entry = current.artifacts[index]!;
         if (entry.deletionToken) {
+          if (releasingTransient) return { index: current, result: undefined };
+          throw new HybridEvidenceArtifactStoreError("artifact_store_conflict");
+        }
+        const existing = entry.references.find(({ referenceId, kind }) =>
+          referenceId === input.referenceId && kind === input.kind);
+        if (input.kind === "transient" && !existing) {
+          if (releasingTransient) return { index: current, result: undefined };
           throw new HybridEvidenceArtifactStoreError("artifact_store_conflict");
         }
         const references = entry.references.filter(
@@ -696,6 +757,7 @@ export function createHybridEvidenceArtifactStore(options: {
             ? false
             : input.active,
           kind: input.kind,
+          expiresAt: existing?.expiresAt ?? null,
           referenceId: input.referenceId,
         });
         const artifacts = [...current.artifacts];
@@ -719,7 +781,7 @@ export function createHybridEvidenceArtifactStore(options: {
         if (entry.deletionToken) {
           throw new HybridEvidenceArtifactStoreError("artifact_store_conflict");
         }
-        if (input.state !== "active" && entry.references.some(({ active }) => active)) {
+        if (input.state !== "active" && entry.references.some((reference) => activeReference(reference, now))) {
           throw new HybridEvidenceArtifactStoreError("artifact_store_conflict");
         }
         const expiresAt = input.state === "active"

@@ -46,13 +46,13 @@ import { PhotonAlertDeliverySubscriptionError } from "../lib/photon-alert-subscr
 import {
   getWorkspaceMonitor,
   listWorkspaceMonitors,
-  pauseWorkspaceMonitorsAfterRestore,
-  suspendWorkspaceMonitorsForArchive,
+  prepareWorkspaceMonitorSessionLifecycle,
   updateWorkspaceMonitor,
   workspaceMonitorScheduleSchema,
 } from "../lib/workspace-monitor-store";
 import {
   readWorkspaceDocument,
+  prepareWorkspaceStrategyGenerationRollover,
   MAXIMUM_WORKSPACE_SCHEDULED_RUNS_PER_DAY,
   workspaceScheduledRunsPerDaySchema,
   writeWorkspaceDocument,
@@ -80,7 +80,9 @@ import {
   PhotonWorkspaceApprovalBlockedError,
   PhotonWorkspaceConflictError,
   PhotonWorkspaceValidationError,
+  photonWorkspaceStoreClient,
   type PhotonWorkspaceAction,
+  type PhotonWorkspaceRelatedUpdate,
   type PhotonWorkspaceState,
 } from "../lib/photon-workspace-store";
 
@@ -2366,16 +2368,26 @@ export default defineChannel({
                 workspaceId: action.workspaceId,
               })
             : null;
-          if (action.action === "archive" && lifecycleScope) {
-            await suspendWorkspaceMonitorsForArchive({ scope: lifecycleScope });
+          const relatedUpdates: PhotonWorkspaceRelatedUpdate[] = lifecycleScope && (action.action === "archive" || action.action === "restore")
+            ? await prepareWorkspaceMonitorSessionLifecycle({ action: action.action, scope: lifecycleScope })
+            : [];
+          if (action.action === "start-fresh" && lifecycleScope) {
+            const routing = await getPhotonWorkspaceManagerState(body.managerToken);
+            const workspace = routing?.workspaces.find(candidate => candidate.id === action.workspaceId);
+            if (!routing || routing.revision !== action.expectedRevision || !workspace || workspace.status !== "active") {
+              throw new PhotonWorkspaceConflictError();
+            }
+            const rollover = await prepareWorkspaceStrategyGenerationRollover({
+              generation: workspace.generation, scope: lifecycleScope,
+            });
+            if (rollover) relatedUpdates.push(rollover);
           }
           const result = await applyPhotonWorkspaceManagerAction(
             body.managerToken,
             action as PhotonWorkspaceAction,
+            photonWorkspaceStoreClient(),
+            relatedUpdates,
           );
-          if (action.action === "restore" && lifecycleScope) {
-            await pauseWorkspaceMonitorsAfterRestore({ scope: lifecycleScope });
-          }
           if (!result) {
             return json({ error: "This session manager link expired." }, 410);
           }

@@ -199,7 +199,8 @@ export function photonApprovalWorkspace(
           ? state.activeWorkspace
           : undefined);
   return workspace?.status === "active" &&
-    workspace.id === state.activeWorkspace.id
+    workspace.id === state.activeWorkspace.id &&
+    (!workspace.sessionId || workspace.sessionId === binding.sessionId)
     ? workspace
     : null;
 }

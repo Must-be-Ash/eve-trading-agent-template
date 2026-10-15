@@ -20,6 +20,13 @@ export const PHOTON_WORKSPACE_LIMIT = 12;
 export const PHOTON_WORKSPACE_RETAINED_LIMIT = 48;
 const MAX_CAS_ATTEMPTS = 5;
 
+export interface PhotonWorkspaceRelatedUpdate {
+  readonly dueKey?: string;
+  readonly expectedRaw: string;
+  readonly nextRaw: string;
+  readonly recordKey: string;
+}
+
 const COMPARE_AND_SET_SCRIPT = `
 if KEYS[2] ~= "" and redis.call("GET", KEYS[2]) then
   return -1
@@ -27,7 +34,28 @@ end
 if redis.call("GET", KEYS[1]) ~= ARGV[1] then
   return 0
 end
+-- Archive/restore and monitor lifecycle must commit together. A rejected
+-- revision or approval must never leave a live session's monitors suspended.
+for i = 3, #KEYS, 2 do
+  local record = (i - 3) / 2
+  if redis.call("GET", KEYS[i]) ~= ARGV[3 + record * 2] then
+    return 0
+  end
+  if KEYS[i + 1] ~= "" then
+    local dueType = redis.call("TYPE", KEYS[i + 1]).ok
+    if dueType ~= "none" and dueType ~= "zset" then
+      return redis.error_reply("monitor_due_index_invalid")
+    end
+  end
+end
 redis.call("SET", KEYS[1], ARGV[2])
+for i = 3, #KEYS, 2 do
+  local record = (i - 3) / 2
+  redis.call("SET", KEYS[i], ARGV[4 + record * 2])
+  if KEYS[i + 1] ~= "" then
+    redis.call("ZREM", KEYS[i + 1], KEYS[i])
+  end
+end
 return 1
 `;
 
@@ -182,6 +210,7 @@ export interface PhotonWorkspaceStoreClient {
     expected: string,
     next: string,
     approvalGuardKey?: string,
+    relatedUpdates?: readonly PhotonWorkspaceRelatedUpdate[],
   ): Promise<"blocked" | "conflict" | "swapped">;
   get(key: string): Promise<unknown>;
   set(
@@ -249,13 +278,14 @@ function store(): PhotonWorkspaceStoreClient {
     expected: string,
     next: string,
     approvalGuardKey?: string,
+    relatedUpdates?: readonly PhotonWorkspaceRelatedUpdate[],
   ): Promise<"blocked" | "conflict" | "swapped"> => {
-    const keys = [key, approvalGuardKey ?? ""];
+    const keys = [key, approvalGuardKey ?? "", ...(relatedUpdates ?? []).flatMap(update => [update.recordKey, update.dueKey ?? ""])];
     const result = async (sha: string) =>
-      client.evalsha<[string, string], number>(
+      client.evalsha<string[], number>(
         sha,
         keys,
-        [expected, next],
+        [expected, next, ...(relatedUpdates ?? []).flatMap(update => [update.expectedRaw, update.nextRaw])],
       );
     let sha = await compareAndSetSha;
     try {
@@ -433,6 +463,7 @@ export async function readPhotonWorkspaceRegistryRecord(
 
 async function mutateRegistry<T>(
   input: {
+    relatedUpdates?: readonly PhotonWorkspaceRelatedUpdate[];
     approvalGuardKey?: string;
     expectedRevision?: number;
     principalId: string;
@@ -470,6 +501,7 @@ async function mutateRegistry<T>(
         String(raw),
         JSON.stringify(next),
         input.approvalGuardKey,
+        input.relatedUpdates,
       );
     } catch (error) {
       try {
@@ -917,6 +949,7 @@ export async function renamePhotonWorkspace(
 
 export async function archivePhotonWorkspace(
   input: {
+    relatedUpdates?: readonly PhotonWorkspaceRelatedUpdate[];
     approvalGuardKey?: string;
     expectedRevision?: number;
     principalId: string;
@@ -984,6 +1017,7 @@ export async function archivePhotonWorkspace(
 
 export async function restorePhotonWorkspace(
   input: {
+    relatedUpdates?: readonly PhotonWorkspaceRelatedUpdate[];
     approvalGuardKey?: string;
     expectedRevision?: number;
     principalId: string;
@@ -1033,6 +1067,7 @@ export async function restorePhotonWorkspace(
 
 export async function startFreshPhotonWorkspace(
   input: {
+    relatedUpdates?: readonly PhotonWorkspaceRelatedUpdate[];
     approvalGuardKey?: string;
     expectedRevision?: number;
     principalId: string;
@@ -1195,6 +1230,7 @@ export async function applyPhotonWorkspaceManagerAction(
   managerToken: string,
   action: PhotonWorkspaceAction,
   client: PhotonWorkspaceStoreClient = store(),
+  relatedUpdates: readonly PhotonWorkspaceRelatedUpdate[] = [],
 ): Promise<PhotonWorkspaceActionResult | null> {
   const capability = await resolveManagerCapability(managerToken, client);
   if (!capability) return null;
@@ -1210,6 +1246,7 @@ export async function applyPhotonWorkspaceManagerAction(
         state: await archivePhotonWorkspace(
           {
             ...common,
+            relatedUpdates,
             ...(action.replacementWorkspaceId
               ? { replacementWorkspaceId: action.replacementWorkspaceId }
               : {}),
@@ -1243,7 +1280,7 @@ export async function applyPhotonWorkspaceManagerAction(
     case "restore":
       return {
         state: await restorePhotonWorkspace(
-          { ...common, workspaceId: action.workspaceId },
+          { ...common, relatedUpdates, workspaceId: action.workspaceId },
           client,
         ),
       };
@@ -1256,7 +1293,7 @@ export async function applyPhotonWorkspaceManagerAction(
       };
     case "start-fresh":
       return startFreshPhotonWorkspace(
-        { ...common, workspaceId: action.workspaceId },
+        { ...common, relatedUpdates, workspaceId: action.workspaceId },
         client,
       );
   }

@@ -1345,6 +1345,40 @@ export async function updateWorkspaceMonitor(
   return next.data;
 }
 
+export async function prepareWorkspaceMonitorSessionLifecycle(input: {
+  action: "archive" | "restore";
+  now?: Date;
+  scope: AuthorizedWorkspaceStoreScope;
+}, client: WorkspaceMonitorStoreClient = store()): Promise<PreparedWorkspaceMonitorUpdate[]> {
+  assertAuthorizedWorkspaceStoreScope(input.scope);
+  const now = (input.now ?? new Date()).toISOString();
+  const updates: PreparedWorkspaceMonitorUpdate[] = [];
+  for (const value of await client.list(workspaceMonitorIndexStorageKey(input.scope))) {
+    const raw = rawValue(value);
+    if (raw === null) continue;
+    const current = parseMonitor(raw, input.scope);
+    if (input.action === "archive"
+      ? current.lifecycleState === "retired" || current.lifecycleState === "suspended_archived"
+      : current.lifecycleState !== "suspended_archived") continue;
+    const monitor = monitorSchema.parse({
+      ...current,
+      configurationRevision: current.configurationRevision + 1,
+      lifecycleState: input.action === "archive" ? "suspended_archived" : "paused",
+      nextOccurrenceAt: null,
+      pauseReason: input.action === "archive" ? "workspace_archived" : "workspace_restored_manual_resume_required",
+      pausedAt: now,
+      preparationRetry: null,
+      ...(current.sourceContinuationAt ? { sourceContinuationAt: null } : {}),
+      updatedAt: now,
+    });
+    const nextRaw = JSON.stringify(monitor);
+    if (Buffer.byteLength(nextRaw, "utf8") > MAX_RECORD_BYTES) throw new WorkspaceMonitorError("monitor_invalid");
+    updates.push({ dueAtMs: null, dueKey: DUE_KEY, expectedRaw: raw, monitor, nextRaw,
+      recordKey: workspaceMonitorRecordStorageKey(input.scope, current.monitorId) });
+  }
+  return updates;
+}
+
 export async function suspendWorkspaceMonitorsForArchive(
   input: { now?: Date; scope: AuthorizedWorkspaceStoreScope },
   client: WorkspaceMonitorStoreClient = store(),

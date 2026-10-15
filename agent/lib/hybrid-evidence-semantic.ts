@@ -11,6 +11,7 @@ import {
 } from "./hybrid-evidence-definition-registry";
 import {
   reconcileHybridEvidenceAttempt,
+  reconcileRecordedHybridEvidenceAttempt,
   reserveHybridEvidenceAttempt,
   type HybridEvidenceBudgetReservation,
 } from "./hybrid-evidence-budget";
@@ -812,18 +813,31 @@ async function deliverHealthNotification(input: {
 }
 
 async function reconcileAcceptedSemanticUsage(input: {
-  job: HybridEvidenceJobRecord["job"];
+  environment?: NodeJS.ProcessEnv;
+  record: HybridEvidenceJobRecord;
   now?: Date;
   scope: AuthorizedWorkspaceStoreScope;
   usage: WorkspaceSemanticModelUsage;
 }, client?: WorkspaceBudgetLedgerClient): Promise<void> {
+  if (input.record.attemptReceipt) {
+    await reconcileRecordedHybridEvidenceAttempt({
+      actualInputTokens: input.usage.inputTokens,
+      actualOutputTokens: input.usage.outputTokens,
+      actualPaidCost: input.usage.paidCostUsd,
+      environment: input.environment,
+      now: input.now,
+      outcome: "reconciled",
+      receipt: input.record.attemptReceipt,
+    }, { workspace: client });
+    return;
+  }
   await reconcileWorkspaceRunBudget({
     actualInputTokens: input.usage.inputTokens,
     actualOutputTokens: input.usage.outputTokens,
     actualPaidCost: input.usage.paidCostUsd,
     now: input.now,
     outcome: "reconciled",
-    runId: input.job.budgetReservation.key,
+    runId: input.record.job.budgetReservation.key,
     scope: input.scope,
   }, client);
 }
@@ -913,7 +927,8 @@ export async function runWorkspaceSemanticEvidenceJob(input: Parameters<
       source: prepared.source,
     }, clients.semantic);
     await reconcileAcceptedSemanticUsage({
-      job: accepted.job,
+      environment: input.environment,
+      record: accepted,
       now: input.now,
       scope: input.scope,
       usage: result.usage,
@@ -1299,7 +1314,8 @@ export async function runWorkspaceSemanticEvidenceBundleJob(input: Parameters<
     })));
     await recordJob(accepted);
     await reconcileAcceptedSemanticUsage({
-      job: accepted.job,
+      environment: input.environment,
+      record: accepted,
       now: input.now,
       scope: input.scope,
       usage: result.usage,

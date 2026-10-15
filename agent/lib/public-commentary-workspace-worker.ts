@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { defineTool } from "eve/tools";
 import { z } from "zod";
@@ -9,6 +9,7 @@ import {
   createHybridEvidenceEphemeralArtifactStore,
   type HybridEvidenceArtifactStore,
 } from "./hybrid-evidence-artifact-store";
+import { HYBRID_EVIDENCE_WORKER_MAX_RUNTIME_MS } from "./hybrid-evidence-auth";
 import type { HybridEvidenceJobStoreClient } from "./hybrid-evidence-job-store";
 import type { HybridEvidenceLineageStoreClient } from "./hybrid-evidence-lineage-store";
 import {
@@ -562,14 +563,17 @@ export function createProductionPublicCommentaryPipeline(input: {
           }, clients?.semantic?.budget);
           throw new PublicCommentaryWorkspaceWorkerError("public_commentary_source_unavailable");
         }
+        const acceptanceUncertain = !coordinated.reused && [
+          "acquisition_uncertain", "transport_timeout", "parser_incomplete",
+        ].includes(coordinated.acquisition.errorCode ?? "");
         await reconcileWorkspaceRunBudget({
-          ...(coordinated.reused ? {} : {
+          ...(coordinated.reused || acceptanceUncertain ? {} : {
             actualInputTokens: 0,
             actualOutputTokens: 0,
             actualPaidCost: coordinated.xReceipt.amountUsd,
           }),
           now: input.now,
-          outcome: coordinated.reused ? "released" : "reconciled",
+          outcome: coordinated.reused ? "released" : acceptanceUncertain ? "uncertain" : "reconciled",
           runId: timelineReservationId,
           scope,
         }, clients?.semantic?.budget);
@@ -907,6 +911,10 @@ export function createProductionPublicCommentaryPipeline(input: {
         throw new PublicCommentaryWorkspaceWorkerError("public_commentary_source_unavailable");
       }
       const bytes = Buffer.from(plaintext, "utf8");
+      const transientReference = {
+        expiresAt: new Date(Date.now() + 2 * HYBRID_EVIDENCE_WORKER_MAX_RUNTIME_MS).toISOString(),
+        referenceId: randomUUID(),
+      };
       const artifact = await artifacts.persist({
         acquisitionId: subject.acquisitionId,
         authority: "X",
@@ -917,6 +925,7 @@ export function createProductionPublicCommentaryPipeline(input: {
         observedAt: statement.observedAt,
         parserEligibility: null,
         sourceInstanceId: subject.sourceInstanceId,
+        transientReference,
         structure: {
           characterCount: plaintext.length,
           columnCount: null,
@@ -1004,6 +1013,10 @@ export function createProductionPublicCommentaryPipeline(input: {
           }),
         });
       } finally {
+        await artifacts.setReference({
+          active: false, artifactDigest: artifact.contentDigest, kind: "transient",
+          referenceId: transientReference.referenceId,
+        });
         await artifacts.deleteUnreferenced(artifact.contentDigest);
       }
     },
@@ -1433,6 +1446,7 @@ async function runPublicCommentaryExecutiveResearch(input: {
     content: string;
     finding: (typeof subjects)[number]["finding"];
     subject: PublicCommentaryResearchSubject;
+    transientReferenceId: string;
   }>> = [];
   /*
    * Each material post is its own story - a Treasury post and a dollar-positioning
@@ -1475,6 +1489,10 @@ async function runPublicCommentaryExecutiveResearch(input: {
         summary: subject.summary ?? finding.summary,
         uncertainty: subject.uncertainty ?? [],
       });
+      const transientReference = {
+        expiresAt: new Date(Date.now() + 2 * HYBRID_EVIDENCE_WORKER_MAX_RUNTIME_MS).toISOString(),
+        referenceId: randomUUID(),
+      };
       const artifact = await artifacts.persist({
         acquisitionId: subject.acquisitionId,
         authority: "X",
@@ -1485,6 +1503,7 @@ async function runPublicCommentaryExecutiveResearch(input: {
         observedAt: subject.statement.observedAt,
         parserEligibility: null,
         sourceInstanceId: subject.sourceInstanceId,
+        transientReference,
         structure: {
           characterCount: content.length,
           columnCount: null,
@@ -1493,7 +1512,7 @@ async function runPublicCommentaryExecutiveResearch(input: {
           sheetCount: null,
         },
       });
-      persisted.push(Object.freeze({ artifact, content, finding, subject }));
+      persisted.push(Object.freeze({ artifact, content, finding, subject, transientReferenceId: transientReference.referenceId }));
       const semantic = await runWorkspaceSemanticEvidenceBundleJob({
         definition: input.runtime.definition,
         environment: input.environment,
@@ -1615,7 +1634,11 @@ async function runPublicCommentaryExecutiveResearch(input: {
       finding,
     });
   } finally {
-    for (const { artifact } of persisted) {
+    for (const { artifact, transientReferenceId } of persisted) {
+      await artifacts.setReference({
+        active: false, artifactDigest: artifact.contentDigest, kind: "transient",
+        referenceId: transientReferenceId,
+      });
       await artifacts.deleteUnreferenced(artifact.contentDigest);
     }
   }

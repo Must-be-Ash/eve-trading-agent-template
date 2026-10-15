@@ -536,7 +536,7 @@ export function createWorkspaceMonitorSchedule(
           ]), "schedule_job_failed");
         }
         const [workspaceClaim] = await Promise.allSettled([
-          flags.dispatch
+          flags.dispatch && flags.paidResearch
             ? dependencies.claimWorkspaceMonitors({
                 leaseForMs: 30 * 60_000,
                 limit: 10,

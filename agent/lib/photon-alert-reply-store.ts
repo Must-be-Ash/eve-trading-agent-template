@@ -22,7 +22,7 @@ const idSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9_./:@-]{1,159}$/u);
 const candidateSchema = z.object({
   alertId: idSchema,
   deliveredAt: z.string().datetime({ offset: true }),
-  deliveryMessageId: idSchema.optional(),
+  deliveryMessageId: z.string().min(1).max(160).optional(),
   title: z.string().min(1).max(240),
   workspaceId: z.string().uuid(),
   workspaceName: z.string().min(1).max(80),

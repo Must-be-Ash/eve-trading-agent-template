@@ -828,6 +828,37 @@ export function prepareWorkspaceStrategyBindingUpdate(input: {
   };
 }
 
+/** Preserve the exact installed pack when only conversation history rolls over. */
+export async function prepareWorkspaceStrategyGenerationRollover(input: {
+  generation: number;
+  now?: Date;
+  scope: AuthorizedWorkspaceStoreScope;
+}, client: WorkspaceStateStoreClient = store()): Promise<{
+  expectedRaw: string;
+  nextRaw: string;
+  recordKey: string;
+} | null> {
+  assertAuthorizedWorkspaceStoreScope(input.scope);
+  const recordKey = workspaceDocumentStorageKey("strategy", input.scope);
+  const expectedRaw = serializedValue(await client.get(recordKey));
+  if (expectedRaw === null) return null;
+  const current = parseDocument("strategy", expectedRaw, input.scope);
+  if (current.schemaVersion !== 2 || current.value.lifecycleState === "unbound") return null;
+  const binding = current.value;
+  const snapshot = binding.pendingSnapshot ?? binding.lastActiveSnapshot;
+  if (!snapshot || snapshot.workspaceGeneration !== input.generation) throw new WorkspaceStateConflictError();
+  const now = input.now ?? new Date();
+  const nextSnapshot = { ...snapshot, workspaceGeneration: input.generation + 1 };
+  const prepared = prepareWorkspaceStrategyBindingUpdate({
+    current, now, scope: input.scope, value: {
+      ...binding,
+      ...(binding.pendingSnapshot ? { pendingSnapshot: nextSnapshot } : { lastActiveSnapshot: nextSnapshot }),
+      timestamps: { ...binding.timestamps, generationRolloverAt: now.toISOString() },
+    },
+  });
+  return { expectedRaw, nextRaw: prepared.raw, recordKey };
+}
+
 export async function writeWorkspaceStrategyBinding(
   input: {
     expectedRevision: number;
