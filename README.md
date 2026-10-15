@@ -205,8 +205,13 @@ npm start               # serve the Next.js production build
 ```
 
 Offline tests require `redis-server` installed locally (CI installs it). Tests use
-disposable local stores and fixture providers. No model calls, trades, messages,
+disposable local stores and fixture providers. No live model calls, trades, messages,
 provider lookups, or public artifact publication are used for acceptance.
+
+The [pre-Eve acceptance report](docs/pre-eve-acceptance.md) records the audited
+commit, assembled local journeys, repaired blockers, reproduction commands, and
+remaining live-provider checks. Optional browser and compiled-worker audits run
+separately from the default suite.
 
 Import the repository into a **new** Vercel project with Node.js 24. Use
 `npm run build:web` as the Next.js build command; `withEve` configures the generated
