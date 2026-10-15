@@ -1,0 +1,60 @@
+{
+  "name": "eve-trading-agent-template",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "An iMessage trading assistant built with Eve, Photon, and Coinbase.",
+  "engines": {
+    "node": "24.x"
+  },
+  "imports": {
+    "#*": "./agent/*",
+    "#artifact-schema": "./agent/lib/artifact-schema.ts",
+    "#mcp-response-limit": "./agent/lib/mcp-response-limit.ts",
+    "#mcp-tool-result": "./agent/lib/mcp-tool-result.ts",
+    "#photon-approval-store": "./agent/lib/photon-approval-store.ts",
+    "#public-app-url": "./agent/lib/public-app-url.ts",
+    "#public-network-address": "./agent/lib/public-network-address.ts"
+  },
+  "scripts": {
+    "prepare:coinbase": "node scripts/embed-coinbase-cli.mjs",
+    "predev": "npm run prepare:coinbase",
+    "dev": "next dev",
+    "dev:agent": "eve dev",
+    "pretypecheck": "npm run prepare:coinbase",
+    "typecheck": "tsc --noEmit",
+    "prebuild": "npm run prepare:coinbase",
+    "build": "eve build && next build",
+    "build:agent": "npm run prepare:coinbase && eve build",
+    "start": "next start",
+    "test": "node --test tests/*.test.mjs",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@ai-sdk/mcp": "2.0.29",
+    "@chat-adapter/state-redis": "4.37.0",
+    "@coinbase/coinbase-cli": "0.0.6",
+    "@photon-ai/chat-adapter-imessage": "3.2.0",
+    "@upstash/redis": "1.38.2",
+    "@vercel/blob": "2.8.0",
+    "@vercel/connect": "0.6.1",
+    "ai": "7.0.58",
+    "chat": "4.37.0",
+    "eve": "0.33.0",
+    "next": "16.3.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-markdown": "10.1.0",
+    "undici": "7.29.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "esbuild": "0.27.0",
+    "just-bash": "3.2.0",
+    "typescript": "7.0.2"
+  }
+}
