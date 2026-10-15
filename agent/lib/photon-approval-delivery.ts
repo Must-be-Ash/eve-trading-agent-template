@@ -6,6 +6,10 @@ import {
 } from "./photon-approval-store";
 import { isPhotonPrincipalAllowed, photonAuth, photonSenderId } from "./photon-auth";
 
+import { getPhotonWorkspaceState } from "./photon-workspace-store";
+import { photonApprovalWorkspace } from "./photon-workspace";
+import { projectPhotonWorkspaceRuntimeScope } from "./workspace-runtime-scope";
+
 /** Deliver once to the recorded durable session; a timeout never means retry. */
 export async function deliverPhotonApproval(
   delivery: PhotonApprovalDelivery,
@@ -16,10 +20,25 @@ export async function deliverPhotonApproval(
     await failPhotonApprovalDecision(delivery).catch(() => undefined);
     return "unavailable";
   }
+  let scope;
+  if (delivery.workspaceId || delivery.workspaceGeneration) {
+    try {
+      const state = await getPhotonWorkspaceState({ principalId: delivery.principalId, threadId: delivery.threadId });
+      const workspace = photonApprovalWorkspace(state, delivery);
+      if (!workspace) throw new Error("Approval session is no longer active.");
+      scope = projectPhotonWorkspaceRuntimeScope({
+        generation: workspace.generation, principalId: delivery.principalId,
+        threadId: delivery.threadId, workspaceId: workspace.id,
+      });
+    } catch {
+      await failPhotonApprovalDecision(delivery).catch(() => undefined);
+      return "unavailable";
+    }
+  }
   try {
     const result = await attachSession(delivery.sessionId).respond(
       [{ optionId: delivery.decision, requestId: delivery.requestId }],
-      { auth: photonAuth(senderId, delivery.threadId) },
+      { auth: photonAuth(senderId, delivery.threadId, scope) },
     );
     if (result.status !== "accepted") {
       await failPhotonApprovalDecision(delivery).catch(() => undefined);

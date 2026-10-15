@@ -28,6 +28,8 @@ await build({
   stdin: {
     contents: `
       export * from "./agent/lib/coinbase-order.ts";
+      export * from "./agent/lib/photon-approval.ts";
+      export * from "./agent/lib/photon-approval-store.ts";
       export * from "./agent/lib/coinbase-cli.ts";
       export * from "./agent/lib/mcp-tool-result.ts";
       export * from "./agent/lib/coinbase-mcp-policy.ts";
@@ -229,9 +231,23 @@ test("uncertain writes stay journaled and are never automatically retried", asyn
   resetProvider();
   const preview = await api.previewTool.execute(ORDER, context());
   const input = { ...ORDER, previewToken: preview.authorization.previewToken };
+  const ctx = context("uncertain-call");
+  const scope = { principalId: OWNER, sessionId: ctx.session.id, threadId: "uncertain-thread" };
+  const prompt = api.createPhotonApprovalPrompt({ kind: "tool-approval", requestId: ctx.callId, action: { toolName: "coinbase_create_order", input } });
+  const saved = await api.savePhotonApproval({ ...scope, prompt });
+  await api.activatePhotonApproval({ ...scope, approvalToken: saved.approvalToken });
+  const claim = await api.claimPhotonApprovalDecision({ approvalToken: saved.approvalToken, decision: "approve" });
+  assert.equal(claim.status, "deliver");
+  await api.completePhotonApprovalDecision(claim.delivery);
   api.provider.fail = "completion state is unknown";
   await assert.rejects(api.createTool.execute(input, context("uncertain-call")), /completion state is unknown/u);
   api.provider.fail = null;
   await assert.rejects(api.createTool.execute(input, context("uncertain-call")), /already attempted.*uncertain/u);
+  const now = Date.now;
+  Date.now = () => Date.parse(preview.authorization.expiresAt) + 1;
+  try { await assert.rejects(api.createTool.execute(input, ctx)); }
+  finally { Date.now = now; }
+  assert.equal(await api.releasePhotonApprovalProcessing(ctx.session.id), "retained");
+  assert.equal(await api.getCurrentPhotonApprovalActivity(scope), "processing");
   assert.equal(api.provider.calls.filter(call => call.name === "coinbase_orders_create").length, 1);
 });

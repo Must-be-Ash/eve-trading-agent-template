@@ -3,6 +3,9 @@ import {
   publicArtifactPageUrl,
 } from "#public-app-url";
 
+export const PHOTON_ALERT_APP_PATH = "/eve/v1/photon-alert";
+export const PHOTON_WORKSPACE_APP_PATH = "/eve/v1/photon-workspaces";
+
 export const PHOTON_APPROVAL_APP_PATH = "/eve/v1/photon-approval";
 
 const PHOTON_PUBLIC_URL_PATTERN = /https:\/\/[^\s<>"'`)\]}]+/giu;
@@ -47,4 +50,16 @@ export function photonArtifactPresentation(
       )}`.trim(),
     url: publicUrl,
   };
+}
+
+export function photonWorkspaceAppUrl(managerToken: string): string {
+  const url = new URL(PHOTON_WORKSPACE_APP_PATH, publicApplicationOrigin());
+  url.hash = managerToken;
+  return url.toString();
+}
+
+export function photonAlertAppUrl(alertToken: string, managerToken?: string): string {
+  const url = new URL(PHOTON_ALERT_APP_PATH, publicApplicationOrigin());
+  url.hash = managerToken ? `${alertToken}.${managerToken}` : alertToken;
+  return url.toString();
 }

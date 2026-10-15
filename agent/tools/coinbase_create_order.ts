@@ -31,26 +31,27 @@ export default defineTool({
   approval: (ctx) => coinbaseApproval(ctx, true),
   async execute(input, ctx) {
     const principal = requireCoinbaseAccess(ctx);
-    let mutationStarted = false;
+    let preflightFailed = false;
     try {
-      verifyOrderPreviewToken(input.previewToken, input, principal.id);
-      assertSpotProduct(
-        await callCoinbaseMcpTool(
-          "coinbase_products_get",
-          { product_id: input.productId },
-          { signal: ctx.abortSignal },
-        ),
-      );
-
       const clientOrderId = clientOrderIdForPreview(input.previewToken);
       const toolInput = orderMcpInput(input, clientOrderId);
-      mutationStarted = true;
       const result = await executeCoinbaseMutation({
         callId: ctx.callId,
-        operation: () =>
-          callCoinbaseMcpTool("coinbase_orders_create", toolInput, {
+        operation: async () => {
+          try {
+            verifyOrderPreviewToken(input.previewToken, input, principal.id);
+            assertSpotProduct(await callCoinbaseMcpTool(
+              "coinbase_products_get", { product_id: input.productId },
+              { signal: ctx.abortSignal },
+            ));
+          } catch (error) {
+            preflightFailed = true;
+            throw error;
+          }
+          return callCoinbaseMcpTool("coinbase_orders_create", toolInput, {
             signal: ctx.abortSignal,
-          }),
+          });
+        },
         principalId: principal.id,
         toolInput,
         toolName: "coinbase_orders_create",
@@ -72,7 +73,7 @@ export default defineTool({
     } catch (error) {
       await markPhotonApprovalExecution({
         sessionId: ctx.session.id,
-        state: mutationStarted ? "uncertain" : "safe-failure",
+        state: preflightFailed ? "safe-failure" : "uncertain",
       }).catch(() => undefined);
       throw error;
     }

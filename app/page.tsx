@@ -11,7 +11,7 @@ export default function Home() {
         <div>
           <p className="eyebrow">Photon · Coinbase · Eve</p>
           <h1>Your market.<br />Your message.<br /><em>Your decision.</em></h1>
-          <p className="intro">Research markets and prepare spot trades from iMessage. Review the exact order before anything moves.</p>
+          <p className="intro">Research markets, follow X accounts in separate sessions, and prepare spot trades from iMessage. Review the exact order before anything moves.</p>
           <a className="button" href={`${repository}#setup`}>Set up your agent <span>↗</span></a>
           <p className="caption">A starter you deploy with your own accounts.</p>
         </div>
@@ -30,9 +30,9 @@ export default function Home() {
         </div>
       </section>
       <section className="features" aria-label="Included capabilities">
-        <article><span className="feature-number">01</span><h2>Text naturally</h2><p>One authorized owner. Durable conversations through Photon and iMessage.</p></article>
-        <article><span className="feature-number">02</span><h2>Approve precisely</h2><p>Spot orders tied to an exact preview, with expiring approvals and replay protection.</p></article>
-        <article><span className="feature-number">03</span><h2>Share the research</h2><p>Public reports, interactive charts, and media. Private account information stays in chat.</p></article>
+        <article><span className="feature-number">01</span><h2>Text naturally</h2><p>One owner, multiple isolated conversations. Background agents and alerts return to the right session.</p></article>
+        <article><span className="feature-number">02</span><h2>Approve precisely</h2><p>Spot orders and cancellations with explicit approvals, expiry, and replay protection.</p></article>
+        <article><span className="feature-number">03</span><h2>Share the research</h2><p>Scheduled X research, public reports, charts, and media. Private account information stays in chat.</p></article>
       </section>
       <footer><span>Built with <a href="https://eve.dev">eve</a></span><a href={`${repository}/blob/main/docs/submission.md`}>Template notes ↗</a></footer>
     </main>

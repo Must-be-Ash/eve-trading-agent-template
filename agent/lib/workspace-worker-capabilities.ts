@@ -1,0 +1,129 @@
+import type { SessionContext } from "eve/context";
+
+import {
+  resolveWorkspaceRuntimeCapabilities,
+  WorkspaceRuntimeCapabilityError,
+  type WorkspaceRuntimeCapabilities,
+  type WorkspaceRuntimeTool,
+} from "./workspace-runtime-capabilities";
+import { readWorkspaceDocument, type WorkspaceStateStoreClient } from "./workspace-state-store";
+import { authorizeWorkspaceWorkerStore, type AuthorizedWorkspaceStoreScope } from "./workspace-store-authorization";
+import { requireWorkspaceWorkerAuth, type WorkspaceWorkerEnvelope } from "./workspace-worker-auth";
+import {
+  getWorkspaceMonitor,
+  type WorkspaceMonitorStoreClient,
+} from "./workspace-monitor-store";
+import {
+  requireWorkspaceWorkerStrategyPackRuntime,
+  type ActiveWorkspaceWorkerStrategyPackRuntime,
+} from "./strategy-pack-runtime";
+
+export interface WorkspaceWorkerToolRegistration<T> {
+  readonly definition: T;
+  readonly metadata: WorkspaceRuntimeTool;
+}
+
+export interface WorkspaceWorkerCapabilitySet<T> {
+  readonly maximumDataAccessClassification: "owner_private" | "public";
+  readonly resolved: WorkspaceRuntimeCapabilities;
+  readonly skillIds: readonly string[];
+  readonly strategyPackRuntime?: ActiveWorkspaceWorkerStrategyPackRuntime | null;
+  readonly tools: Readonly<Record<string, T>>;
+}
+
+export async function resolveWorkspaceWorkerCapabilitySnapshot<T>(input: {
+  deploymentHardDeniedIds?: readonly string[];
+  envelope: Pick<WorkspaceWorkerEnvelope, "capabilityRevision" | "ownerId" | "sources" | "workspaceId">;
+  registry: readonly WorkspaceWorkerToolRegistration<T>[];
+  scope: AuthorizedWorkspaceStoreScope;
+  stateClient?: WorkspaceStateStoreClient;
+}): Promise<WorkspaceWorkerCapabilitySet<T>> {
+  const manifest = await readWorkspaceDocument(
+    "capabilities",
+    input.scope,
+    input.stateClient,
+  );
+  if (!manifest) {
+    throw new WorkspaceRuntimeCapabilityError("capability_manifest_stale");
+  }
+  const resolved = resolveWorkspaceRuntimeCapabilities({
+    catalog: input.registry.map((registration) => registration.metadata),
+    deploymentHardDeniedIds: input.deploymentHardDeniedIds,
+    expectedCapabilityRevision: input.envelope.capabilityRevision,
+    manifest,
+    ownerId: input.envelope.ownerId,
+    workspaceId: input.envelope.workspaceId,
+  });
+  const allowedSources = new Map(
+    manifest.value.sources.map((source) => [source.sourceId, source.origin]),
+  );
+  if (input.envelope.sources.some(
+    (source) => allowedSources.get(source.sourceId) !== source.origin,
+  )) {
+    throw new WorkspaceRuntimeCapabilityError("capability_scope_mismatch");
+  }
+  const allowedTools = new Set(resolved.toolIds);
+  const tools = Object.freeze(Object.fromEntries(
+    input.registry
+      .filter((registration) => allowedTools.has(registration.metadata.id))
+      .map((registration) => [registration.metadata.id, registration.definition]),
+  ));
+  return Object.freeze({
+    maximumDataAccessClassification: manifest.value.maximumDataAccessClassification,
+    resolved,
+    skillIds: resolved.skillIds,
+    tools,
+  });
+}
+
+export async function resolveWorkspaceWorkerStepCapabilities<T>(input: {
+  ctx: { readonly session: { readonly auth: SessionContext["session"]["auth"] } };
+  deploymentHardDeniedIds?: readonly string[];
+  environment?: NodeJS.ProcessEnv;
+  monitorClient?: WorkspaceMonitorStoreClient;
+  registry: readonly WorkspaceWorkerToolRegistration<T>[];
+  stateClient?: WorkspaceStateStoreClient;
+}): Promise<WorkspaceWorkerCapabilitySet<T>> {
+  const envelope = requireWorkspaceWorkerAuth(
+    input.ctx,
+    {},
+    input.environment,
+  );
+  const scope = authorizeWorkspaceWorkerStore(input.ctx, input.environment);
+  const stateClient = input.stateClient;
+  const capabilities = await resolveWorkspaceWorkerCapabilitySnapshot({
+    deploymentHardDeniedIds: input.deploymentHardDeniedIds,
+    envelope,
+    registry: input.registry,
+    scope,
+    stateClient,
+  });
+  const monitor = await getWorkspaceMonitor(
+    scope,
+    envelope.monitorId,
+    input.monitorClient,
+  );
+  if (!monitor) {
+    throw new WorkspaceRuntimeCapabilityError("capability_scope_mismatch");
+  }
+  if (
+    input.registry.length > 0 &&
+    monitor.requiredCapabilityIds.some(
+      (capabilityId) => !capabilities.resolved.toolIds.includes(capabilityId),
+    )
+  ) {
+    throw new WorkspaceRuntimeCapabilityError("capability_scope_mismatch");
+  }
+  try {
+    const strategyPackRuntime = await requireWorkspaceWorkerStrategyPackRuntime({
+      envelope,
+      environment: input.environment,
+      monitor,
+      scope,
+      stateClient,
+    });
+    return Object.freeze({ ...capabilities, strategyPackRuntime });
+  } catch {
+    throw new WorkspaceRuntimeCapabilityError("capability_scope_mismatch");
+  }
+}

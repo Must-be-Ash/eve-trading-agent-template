@@ -111,10 +111,12 @@ test("approval lifecycle is atomic, one-use, sender-bound, and retains uncertain
     const revokedScope = scope("revoked");
     const revoked = await owners.savePhotonApproval({ ...revokedScope, prompt: prompt("revoked") });
     await owners.activatePhotonApproval({ ...revokedScope, approvalToken: revoked.approvalToken });
+    const guardsBeforeRevocation = (await redis.command("KEYS", "eve:photon:v3:processing-approval:*")).sort();
     delete process.env.PHOTON_ALLOWED_PRINCIPALS;
     const denied = await handler("/decision")(post("/eve/v1/photon-approval/decision", { approvalToken: revoked.approvalToken, decision: "approve" }), args);
     assert.equal(denied.status, 409);
     assert.equal(responses.length, 1, "revoked owner cannot use an old bearer");
+    assert.deepEqual((await redis.command("KEYS", "eve:photon:v3:processing-approval:*")).sort(), guardsBeforeRevocation, "a definitely undelivered decision must not leave a permanent processing guard");
   } finally { await redis.close(); }
 });
 

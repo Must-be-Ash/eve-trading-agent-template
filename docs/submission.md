@@ -13,9 +13,12 @@ configuration. They range from focused agents to full applications. Kody demonst
 custom Chat SDK channels and Redis; OpenInstinct includes a substantial frontend.
 Their feature counts are not a template limit.
 
-We chose a smaller scope for maintainability: one owner, Photon, Coinbase spot
-orders, approvals, and artifact views. The original application's strategy,
-monitoring, workspace, and paid-service systems are absent.
+This template retains one owner with multiple Photon sessions, durable background
+workers, scheduled X monitors and alerts, Coinbase spot trading and cancellations,
+approvals, and artifact views. One configurable X playbook remains. Specialized
+pipelines, personal configuration, AgentCash, Masterkey, and Telegram are removed.
+The examples support this feature depth; their pattern is a coherent, independently
+configurable application rather than a fixed maximum number of features.
 
 ## Actual listing mechanism
 
@@ -38,7 +41,7 @@ This is a draft for maintainers to adapt, not a submitted registration:
 {
   slug: "eve-trading-agent-template",
   title: "iMessage Trading Assistant",
-  description: "A personal iMessage trading assistant with Coinbase market data, approved spot orders, and shareable reports and charts.",
+  description: "A personal iMessage trading assistant with Coinbase market data, approved spot trades, isolated sessions, scheduled X alerts, and shareable research.",
   category: "Chat",
   integrations: ["HTTP API", "Vercel"],
   model: "openai/gpt-5.4",
@@ -53,6 +56,9 @@ This is a draft for maintainers to adapt, not a submitted registration:
     "agent/channels/photon-approval-app.ts",
     "agent/tools/coinbase_preview_order.ts",
     "agent/tools/coinbase_create_order.ts",
+    "agent/tools/coinbase_cancel_order.ts",
+    "agent/channels/photon-workspace-app.ts",
+    "agent/schedules/monitors.ts",
     "agent/tools/publish_report.ts",
     "agent/skills/coinbase.md",
     "agent/skills/artifact-publishing.md",

@@ -1,5 +1,7 @@
 import type { SessionAuthContext } from "eve/context";
 
+import { workspaceRuntimeScopeAttributes, type WorkspaceRuntimeScope } from "./workspace-runtime-scope";
+
 export function photonPrincipalId(senderId: string): string {
   return `imessage:${senderId}`;
 }
@@ -10,7 +12,6 @@ export function photonSenderId(principalId: string): string | null {
     : null;
 }
 
-/** A template deployment belongs to one explicitly configured iMessage owner. */
 export function isPhotonPrincipalAllowed(principalId: string): boolean {
   const entries = (process.env.PHOTON_ALLOWED_PRINCIPALS ?? "")
     .split(",").map((entry) => entry.trim()).filter(Boolean);
@@ -18,13 +19,13 @@ export function isPhotonPrincipalAllowed(principalId: string): boolean {
 }
 
 /** Call only with the sender extracted from a verified Photon webhook. */
-export function photonAuth(senderId: string, threadId: string): SessionAuthContext {
+export function photonAuth(senderId: string, threadId: string, scope?: WorkspaceRuntimeScope, additionalAttributes: Readonly<Record<string, string>> = {}): SessionAuthContext {
   const principalId = photonPrincipalId(senderId);
   if (!isPhotonPrincipalAllowed(principalId)) {
     throw new Error("This iMessage identity is not authorized.");
   }
   return {
-    attributes: { channel: "photon", thread_id: threadId },
+    attributes: { ...additionalAttributes, channel: "photon", thread_id: threadId, ...(scope ? workspaceRuntimeScopeAttributes(scope) : {}) },
     authenticator: "photon-imessage-webhook",
     issuer: "photon-imessage",
     principalId,

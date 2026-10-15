@@ -10,10 +10,13 @@ const projectRoot = new URL("../", import.meta.url).pathname;
 const directory = await mkdtemp(join(projectRoot, "tests/.coinbase-cancel-"));
 const bundlePath = join(directory, "fixture.mjs");
 const providerFixture = `
-  export const provider = { calls: [], order: null, productType: "SPOT", response: null, fail: false };
+  export const provider = { calls: [], order: null, productType: "SPOT", response: null, fail: false, failRead: false };
   export async function callCoinbaseMcpTool(name, input) {
     provider.calls.push({ name, input });
-    if (name === "coinbase_orders_get") return provider.order;
+    if (name === "coinbase_orders_get") {
+      if (provider.failRead) throw new Error("Order status unavailable");
+      return provider.order;
+    }
     if (name === "coinbase_products_get") return { product_type: provider.productType };
     if (name !== "coinbase_orders_cancel") throw new Error("Unexpected provider action");
     if (provider.fail) throw new Error("Transport timed out; completion state is unknown");
@@ -67,6 +70,7 @@ function resetProvider(target = api) {
   target.provider.productType = "SPOT";
   target.provider.response = { results: [{ order_id: ORDER_ID, success: true }] };
   target.provider.fail = false;
+  target.provider.failRead = false;
 }
 async function approve(ctx) {
   const scope = { principalId: OWNER, sessionId: ctx.session.id, threadId: `thread-${ctx.callId}` };
@@ -122,6 +126,7 @@ test("cancellation requires approval and rechecks the live owner's authorization
 });
 
 test("final order checks reject terminal, unknown, mismatched, or non-spot orders before cancellation", async () => {
+  let caseId = 0;
   for (const order of [
     ...["FILLED", "CANCELLED", "EXPIRED", "FAILED", "PENDING", "UNKNOWN_ORDER_STATUS"].map(status => ({ order_id: ORDER_ID, product_id: "BTC-USD", status })),
     { order_id: OTHER_ID, product_id: "BTC-USD", status: "OPEN" },
@@ -130,7 +135,7 @@ test("final order checks reject terminal, unknown, mismatched, or non-spot order
   ]) {
     resetProvider();
     api.provider.order = order;
-    await assert.rejects(api.cancelTool.execute(input, context(`not-open-${order?.status}`)), /could not be confirmed as OPEN/u);
+    await assert.rejects(api.cancelTool.execute(input, context(`not-open-${caseId++}`)), /could not be confirmed as OPEN/u);
     assert.deepEqual(api.provider.calls.map(call => call.name), ["coinbase_orders_get"]);
   }
   resetProvider();
@@ -195,5 +200,19 @@ test("concurrent execution of the same approved cancellation cannot send two mut
     api.cancelTool.execute(input, ctx), api.cancelTool.execute(input, ctx),
   ]);
   assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
+  assert.equal(api.provider.calls.filter(call => call.name === "coinbase_orders_cancel").length, 1);
+});
+
+test("a replay cannot release an uncertain cancellation when fresh status reads would fail", async () => {
+  resetProvider();
+  const ctx = context("uncertain-read-replay");
+  const scope = await approve(ctx);
+  api.provider.fail = true;
+  await assert.rejects(api.cancelTool.execute(input, ctx), /unknown/u);
+  api.provider.fail = false;
+  api.provider.failRead = true;
+  await assert.rejects(api.cancelTool.execute(input, ctx));
+  assert.equal(await api.releasePhotonApprovalProcessing(ctx.session.id), "retained");
+  assert.equal(await api.getCurrentPhotonApprovalActivity(scope), "processing");
   assert.equal(api.provider.calls.filter(call => call.name === "coinbase_orders_cancel").length, 1);
 });

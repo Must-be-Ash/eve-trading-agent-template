@@ -25,38 +25,41 @@ export default defineTool({
   inputSchema: cancelOrderSchema,
   approval: (ctx) => coinbaseApproval(ctx, true),
   async execute(input, ctx) {
-    let mutationStarted = false;
+    const principal = requireCoinbaseAccess(ctx);
+    const { order_id } = cancelOrderSchema.parse(input);
+    let preflightFailed = false;
     try {
-      const principal = requireCoinbaseAccess(ctx);
-      const { order_id } = cancelOrderSchema.parse(input);
-      const order = openOrderSchema.safeParse(await callCoinbaseMcpTool(
-        "coinbase_orders_get",
-        { order_id },
-        { signal: ctx.abortSignal },
-      ));
-      if (!order.success || order.data.order_id !== order_id) {
-        throw new Error("The exact Coinbase order could not be confirmed as OPEN. No cancellation was sent; inspect its current status.");
-      }
-      const product = await callCoinbaseMcpTool(
-        "coinbase_products_get",
-        { product_id: order.data.product_id },
-        { signal: ctx.abortSignal },
-      );
-      if (
-        typeof product !== "object" || product === null ||
-        Reflect.get(product, "product_type") !== "SPOT"
-      ) {
-        throw new Error("Eve is restricted to Coinbase spot products. No cancellation was sent.");
-      }
-
       const toolInput = { order_ids: [order_id] };
-      mutationStarted = true;
       const result = await executeCoinbaseMutation({
         callId: ctx.callId,
         principalId: principal.id,
         toolInput,
         toolName: "coinbase_orders_cancel",
         operation: async () => {
+          try {
+            const order = openOrderSchema.safeParse(await callCoinbaseMcpTool(
+              "coinbase_orders_get",
+              { order_id },
+              { signal: ctx.abortSignal },
+            ));
+            if (!order.success || order.data.order_id !== order_id) {
+              throw new Error("The exact Coinbase order could not be confirmed as OPEN. No cancellation was sent; inspect its current status.");
+            }
+            const product = await callCoinbaseMcpTool(
+              "coinbase_products_get",
+              { product_id: order.data.product_id },
+              { signal: ctx.abortSignal },
+            );
+            if (
+              typeof product !== "object" || product === null ||
+              Reflect.get(product, "product_type") !== "SPOT"
+            ) {
+              throw new Error("Eve is restricted to Coinbase spot products. No cancellation was sent.");
+            }
+          } catch (error) {
+            preflightFailed = true;
+            throw error;
+          }
           const response = await callCoinbaseMcpTool("coinbase_orders_cancel", toolInput, {
             signal: ctx.abortSignal,
           });
@@ -87,7 +90,7 @@ export default defineTool({
     } catch (error) {
       await markPhotonApprovalExecution({
         sessionId: ctx.session.id,
-        state: mutationStarted ? "uncertain" : "safe-failure",
+        state: preflightFailed ? "safe-failure" : "uncertain",
       }).catch(() => undefined);
       throw error;
     }

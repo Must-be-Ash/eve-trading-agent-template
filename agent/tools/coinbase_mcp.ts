@@ -13,8 +13,6 @@ import {
 } from "../lib/coinbase-mcp";
 import { validateCoinbaseMcpInput } from "../lib/coinbase-mcp-policy";
 
-// Native writes are deliberately absent. Orders use the authored preview and
-// create tools, which bind approval to the exact order and protect replay.
 const READ_ONLY_TOOLS = new Set([
   "coinbase_orders_list",
   "coinbase_orders_get",

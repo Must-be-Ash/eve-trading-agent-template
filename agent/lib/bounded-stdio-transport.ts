@@ -36,7 +36,6 @@ const DEFAULT_INHERITED_ENV_VARS =
       ]
     : ["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER"];
 
-/** Explicit child values take precedence over safe inherited defaults. */
 function childEnvironment(
   customEnv?: Record<string, string>,
 ): Record<string, string> {

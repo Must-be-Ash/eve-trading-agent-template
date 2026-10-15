@@ -10,3 +10,5 @@ dist/
 .DS_Store
 *.tsbuildinfo
 agent/lib/coinbase-cli-source.generated.ts
+agent/lib/photon-app-icon.generated.ts
+tests/.*-*/
