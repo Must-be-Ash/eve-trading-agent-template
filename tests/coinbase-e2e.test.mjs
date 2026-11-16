@@ -4,20 +4,17 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { build } from 'esbuild';
-import { mockModel } from 'eve/evals';
 import { startTestRedis } from './helpers/photon-redis.mjs';
 
-// Value: the real Eve approval park/resume must reach the actual Photon card and
-// HTTP decision route before a financial mutation. Isolated execute/store tests
-// cannot catch breaks in that composition. Only model and external providers
-// are fixtures; no application approval, store, or policy owner is replaced.
+// Value: an Eve approval pause must reach the actual Photon card and HTTP
+// decision route before a financial mutation, and the resumed tool must run the
+// real policy and execute path. Isolated execute/store tests cannot catch breaks
+// in that composition. Eve 1.0 has no public in-process tool loop, so the pause
+// and resume are v27 session events folded with eve/events and delivered to the
+// real Photon channel handlers. Only providers are fixtures; no application
+// approval, store, or policy owner is replaced.
 const root = fileURLToPath(new URL('../', import.meta.url));
-const eveRoot = new URL('../node_modules/eve/dist/src/', import.meta.url);
-const { createToolLoopHarness } = await import(new URL('harness/tool-loop.js', eveRoot));
-const { dispatchDynamicToolEvent } = await import(new URL('context/dynamic-tool-lifecycle.js', eveRoot));
-const { createToolExecuteWithAuth } = await import(new URL('execution/tool-auth.js', eveRoot));
-const { ContextContainer, contextStorage } = await import(new URL('context/container.js', eveRoot));
-const { SessionKey, AuthKey, SessionIdKey, InitiatorAuthKey } = await import(new URL('context/keys.js', eveRoot));
+const { emptySessionView, foldEvents } = await import('eve/events');
 const directory = await mkdtemp(join(root, 'tests/.coinbase-e2e-'));
 const file = join(directory, 'app.mjs');
 const fixtures = `
@@ -45,7 +42,7 @@ const fixtures = `
 `;
 await build({
   absWorkingDir: root, stdin: { contents: `
-    export { default as photon } from './agent/channels/photon.ts';
+    export { default as photon, photonChannelEvents } from './agent/channels/photon.ts';
     export { default as approvalApp } from './agent/channels/photon-approval-app.ts';
     export { default as dynamicTools } from './agent/tools/coinbase_mcp.ts';
     export { default as previewTool } from './agent/tools/coinbase_preview_order.ts';
@@ -97,6 +94,20 @@ function route(suffix) { return app.approvalApp.routes.find(route => route.metho
 function post(suffix, body) { return new Request(`https://fixture.example/eve/v1/photon-approval/${suffix}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }); }
 function mutations() { return app.fixture.calls.filter(call => ['coinbase_orders_create', 'coinbase_orders_cancel'].includes(call.name)); }
 
+function sessionEvents() {
+  let view = emptySessionView();
+  let line = 0;
+  return {
+    get view() { return view; },
+    commit(...events) {
+      const stored = events.map((event, index) => ({ ...event, meta: { position: { line, index }, endOfLine: index === events.length - 1 } }));
+      line += 1;
+      view = foldEvents(view, stored);
+      return stored;
+    },
+  };
+}
+
 async function scenario(name, { cancel = false, changedOrder = false } = {}) {
   app.fixture.calls.length = 0;
   app.fixture.cards.length = 0;
@@ -109,74 +120,83 @@ async function scenario(name, { cancel = false, changedOrder = false } = {}) {
   const sessionId = `session-${name}`;
   assert.equal(await app.savePhotonWorkspaceSession({ ...scope, workspaceId: workspace.id, generation: workspace.generation, sessionId }), true);
   const auth = app.photonAuth('+15555550100', scope.threadId, app.projectPhotonWorkspaceRuntimeScope({ ...scope, workspaceId: workspace.id, generation: workspace.generation }));
-  const ctx = new ContextContainer();
-  ctx.set(SessionKey, { sessionId, auth: { current: auth, initiator: auth }, turn: { id: 'turn-1' } });
-  ctx.set(AuthKey, auth);
-  ctx.set(InitiatorAuthKey, auth);
-  ctx.set(SessionIdKey, sessionId);
-  const events = [];
+  const session = { id: sessionId, auth: { current: auth, initiator: auth } };
+  const toolContext = callId => ({ callId, abortSignal: new AbortController().signal, session });
   const posts = [];
   const channel = { thread: { id: app.photonWorkspaceThreadId(scope.threadId, workspace), post: async value => { posts.push(value); } }, state: {} };
-  let modelToolResults = [];
-  const model = mockModel(({ toolResults, tools }) => {
-    modelToolResults = toolResults;
-    assert.ok(tools.some(tool => tool.name === 'coinbase_balance'));
-    assert.equal(tools.some(tool => tool.name === 'coinbase_orders_create' || tool.name === 'coinbase_transfer'), false);
-    if (!toolResults.some(result => result.name === 'coinbase_balance')) {
-      return { toolCalls: [{ id: `balance-${name}`, name: 'coinbase_balance', input: {} }] };
-    }
-    if (cancel) return toolResults.some(result => result.name === 'coinbase_cancel_order')
-      ? 'Cancellation reviewed.' : { toolCalls: [{ id: `cancel-${name}`, name: 'coinbase_cancel_order', input: { order_id: ORDER_ID } }] };
-    const preview = toolResults.find(result => result.name === 'coinbase_preview_order');
-    if (!preview) return { toolCalls: [{ id: `preview-${name}`, name: 'coinbase_preview_order', input: ORDER }] };
-    if (toolResults.some(result => result.name === 'coinbase_create_order')) return 'Order reviewed.';
-    const token = preview.output.authorization.previewToken;
-    return { toolCalls: [{ id: `create-${name}`, name: 'coinbase_create_order', input: { ...ORDER, ...(changedOrder ? { quoteSize: '11.00' } : {}), previewToken: token } }] };
+  const stream = sessionEvents();
+  const turnId = `turn-${name}`;
+  const handle = async (handler, event) => app.photonChannelEvents[handler](event, {
+    channel, session, view: stream.view, position: event.meta.position, now: new Date(),
   });
-  const definitions = [['coinbase_preview_order', app.previewTool], ['coinbase_create_order', app.createTool], ['coinbase_cancel_order', app.cancelTool]];
-  const tools = new Map(definitions.map(([name, tool]) => [name, { ...tool, name, execute: createToolExecuteWithAuth({ scope: name, execute: tool.execute }) }]));
-  const harness = createToolLoopHarness({ mode: 'conversation', capabilities: { requestInput: true }, tools,
-    resolveModel: async () => model,
-    handleEvent: async (event, messages = []) => {
-      events.push(event);
-      await dispatchDynamicToolEvent({ ctx, event, messages, resolvers: [{ slug: 'coinbase_mcp', logicalPath: 'agent/tools/coinbase_mcp.ts', eventNames: ['step.started'], events: app.dynamicTools.events }] });
-      if (['input.requested', 'message.completed', 'turn.completed', 'turn.failed'].includes(event.type)) {
-        await app.photon.adapter[event.type]?.(event.data, channel);
-      }
-    },
-  });
-  let session = { sessionId, continuationToken: channel.thread.id, history: [],
-    agent: { modelReference: { id: 'offline-model', provider: 'eve-mock' }, system: 'Fixture: use the available order tools.', tools: [] },
-    compaction: { threshold: 100000, recentWindowSize: 20 } };
-  async function run(input) {
-    let step = harness;
-    for (let index = 0; index < 8; index++) {
-      const result = await contextStorage.run(ctx, () => step(session, input));
-      session = JSON.parse(JSON.stringify(result.session));
-      if (typeof result.next !== 'function') return result;
-      step = result.next;
-      input = undefined;
-    }
-    throw new Error('Fixture model exceeded bounded harness steps');
+  const modelToolResults = [];
+
+  // The model's first steps: discover owner-only read tools, then prepare the write.
+  const dynamicTools = await app.dynamicTools[Symbol.for('eve.dynamic')]({ session });
+  assert.ok(dynamicTools.coinbase_balance);
+  assert.equal(Boolean(dynamicTools.coinbase_orders_create || dynamicTools.coinbase_transfer), false);
+  await dynamicTools.coinbase_balance.execute({}, toolContext(`balance-${name}`));
+  let toolName;
+  let tool;
+  let input;
+  if (cancel) {
+    toolName = 'coinbase_cancel_order';
+    tool = app.cancelTool;
+    input = { order_id: ORDER_ID };
+  } else {
+    const preview = await app.previewTool.execute(ORDER, toolContext(`preview-${name}`));
+    toolName = 'coinbase_create_order';
+    tool = app.createTool;
+    input = { ...ORDER, ...(changedOrder ? { quoteSize: '11.00' } : {}), previewToken: preview.authorization.previewToken };
   }
-  await run({ message: cancel ? 'Cancel my exact open order.' : 'Buy 10 USD of BTC, after I approve.' });
-  const pending = events.find(event => event.type === 'input.requested');
-  assert.ok(pending, JSON.stringify(events));
+  const callId = `${toolName}-${name}`;
+  assert.equal(await tool.approval({ ...toolContext(callId), toolName, toolInput: input }), 'user-approval');
+
+  // Eve parks the call for approval: the turn pauses on one interaction.
+  const interactionId = `approval-${name}`;
+  stream.commit({ type: 'session.started', data: {} });
+  stream.commit({ type: 'turn.started', data: { turnId, cause: { deliveryId: `delivery-${name}` }, follows: null }, scope: { turnId } });
+  stream.commit({ type: 'call.requested', data: { callId, owner: { turnId }, capability: { kind: 'tool', name: toolName }, input }, scope: { turnId } });
+  const [, paused] = stream.commit(
+    { type: 'interaction.opened', data: { interactionId, subject: { callId }, request: { kind: 'approval', prompt: `Approve ${toolName}?`, options: [{ id: 'approve', label: 'Approve' }, { id: 'deny', label: 'Deny' }] } }, scope: { turnId } },
+    { type: 'turn.paused', data: { turnId, awaiting: [{ interactionId }] }, scope: { turnId } },
+  );
+  await handle('turn.paused', paused);
   assert.equal(app.fixture.cards.length, 1, JSON.stringify(posts));
   assert.equal(app.fixture.cards[0].threadId, scope.threadId);
   const token = new URL(app.fixture.cards[0].url).hash.slice(1);
-  assert.equal(mutations().length, 0, 'the harness must park without a financial write');
+  assert.equal(mutations().length, 0, 'the pause must not perform a financial write');
+
+  // Eve's resume: an approved answer runs the real tool, then the turn settles.
+  async function resume(answers) {
+    const [answer] = answers;
+    assert.equal(answer.interactionId, interactionId);
+    stream.commit({ type: 'interaction.settled', data: { interactionId, outcome: answer.optionId === 'approve' ? 'accepted' : 'declined' }, scope: { turnId } });
+    if (answer.optionId === 'approve') {
+      try {
+        const output = await tool.execute(input, toolContext(callId));
+        modelToolResults.push({ name: toolName, isError: false, output });
+      } catch (error) {
+        modelToolResults.push({ name: toolName, isError: true, output: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    const reply = cancel ? 'Cancellation reviewed.' : 'Order reviewed.';
+    const [, settled] = stream.commit(
+      { type: 'content.completed', data: { partId: `reply-${name}`, kind: 'text', phase: 'reply', value: reply }, scope: { turnId } },
+      { type: 'turn.settled', data: { turnId, outcome: 'completed' }, scope: { turnId } },
+    );
+    await handle('turn.settled', settled);
+  }
   const deliveries = [];
-  const args = { attachSession: id => ({ respond: async (inputResponses, options) => {
+  const args = { attachSession: id => ({ respond: async (answers, options) => {
     assert.equal(id, sessionId);
     assert.equal(options.auth.principalId, OWNER);
     assert.equal(options.auth.attributes.workspace_id, workspace.id);
-    deliveries.push({ id, inputResponses, auth: options.auth });
-    await run({ inputResponses });
-    return { status: 'accepted', sessionId: id };
+    deliveries.push({ id, answers, auth: options.auth });
+    await resume(answers);
+    return { sessionId: id, deliveryId: `delivery-${deliveries.length}` };
   } }) };
-  return { scope, workspace, sessionId, token, events, posts, pending, deliveries, run,
-    get modelToolResults() { return modelToolResults; },
+  return { scope, workspace, sessionId, token, posts, deliveries, modelToolResults,
     async decide(decision = 'approve') { const response = await route('decision')(post('decision', { approvalToken: token, decision }), args); return { status: response.status, body: await response.json() }; },
     async state() { return (await route('state')(post('state', { approvalToken: token }))).json(); },
   };

@@ -19,6 +19,16 @@ not provider charges. Nothing was pushed, deployed, submitted, or sent to a pers
 
 ## Scope of the evidence
 
+### Eve 1.0 upgrade
+
+This evidence predates the move from Eve 0.33.0 to Eve 1.0.0. That upgrade
+changed the runtime bridge (now version 0.1.0, built for Eve 1.0's internal
+workflow runtime), so it is no longer byte-identical to Adaam's. It also moved
+the session-event consumers to v27 events and replaced the removed per-session
+token caps with `limits.sessionUsage` and a worker budget hook. The offline
+suite was updated to match and passes, but the live checks below were not rerun
+on 1.0.
+
 ### Relationship to Adaam
 
 A subsequent read-only source comparison used Adaam commit

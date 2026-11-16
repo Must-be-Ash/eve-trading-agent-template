@@ -322,6 +322,7 @@ export async function drainPublicCommentaryHybridWorker(
   let toolCalls = 0;
   let lastTool: string | null = null;
   let lastToolErrored = false;
+  const callNames = new Map<string, string>();
   try {
     for (;;) {
       const next = await (settlementDeadline
@@ -329,50 +330,44 @@ export async function drainPublicCommentaryHybridWorker(
         : reader.read());
       if (next.done) break;
       const event = next.value;
-      if (event.type === "step.completed") {
-        if (event.data.usage?.inputTokens === undefined || event.data.usage.outputTokens === undefined) {
-          usageComplete = false;
-        }
-        inputTokens += event.data.usage?.inputTokens ?? 0;
-        outputTokens += event.data.usage?.outputTokens ?? 0;
+      if (event.type === "usage.recorded" && event.data.kind === "model") {
+        inputTokens += event.data.usage.inputTokens;
+        outputTokens += event.data.usage.outputTokens;
       }
-      if (
-        event.type === "action.result" &&
-        event.data.result.kind === "tool-result" &&
-        typeof event.data.result.toolName === "string"
-      ) {
+      if (event.type === "call.requested") {
+        callNames.set(event.data.callId, event.data.capability.name);
+      }
+      if (event.type === "call.settled" && callNames.has(event.data.callId)) {
+        const toolName = callNames.get(event.data.callId) ?? "";
         toolCalls += 1;
-        lastTool = event.data.result.toolName.slice(0, 60);
-        lastToolErrored = event.data.result.isError === true;
-      }
-      if (
-        event.type === "action.result" &&
-        event.data.status === "completed" &&
-        event.data.result.kind === "tool-result" &&
-        event.data.result.toolName === "complete_hybrid_evidence_job" &&
-        event.data.result.isError !== true
-      ) {
-        if (!completed) {
-          // Eve emits this action before its usage event and can run a final
-          // model step afterward. Wait briefly for the terminal turn, not for
-          // stream closure. If it cannot settle, the caller keeps the full
-          // conservative allowance rather than reporting partial usage.
-          settlementDeadline = new Promise<never>((_resolve, reject) => {
-            settlementTimer = setTimeout(() => reject(new Error("completion_usage_unsettled")), 5_000);
-          });
+        lastTool = toolName.slice(0, 60);
+        lastToolErrored = event.data.outcome !== "completed";
+        if (event.data.outcome === "completed" && toolName === "complete_hybrid_evidence_job") {
+          if (!completed) {
+            // Eve settles this call before its usage event and can run a final
+            // model step afterward. Wait briefly for the terminal turn, not for
+            // stream closure. If it cannot settle, the caller keeps the full
+            // conservative allowance rather than reporting partial usage.
+            settlementDeadline = new Promise<never>((_resolve, reject) => {
+              settlementTimer = setTimeout(() => reject(new Error("completion_usage_unsettled")), 5_000);
+            });
+          }
+          completed = true;
         }
-        completed = true;
       }
-      if (
-        event.type === "step.failed" ||
-        event.type === "turn.failed" ||
-        event.type === "session.failed"
-      ) {
+      const failure =
+        (event.type === "turn.settled" && event.data.outcome !== "completed") ||
+        (event.type === "session.ended" && event.data.outcome === "failed")
+          ? event.data.error ?? { code: `${event.type}:${event.data.outcome}`, message: "Worker run did not complete." }
+          : undefined;
+      if (failure) {
         usageComplete = false;
-        terminalFailure = Object.freeze({ code: event.data.code, message: event.data.message });
+        terminalFailure = Object.freeze({ code: failure.code, message: failure.message });
       }
-      if (event.type === "turn.completed" || event.type === "session.completed") {
-        settled = true;
+      if (event.type === "turn.settled" || event.type === "session.ended") {
+        // Eve 1.0 keeps an idle session's stream open, so stop at the first
+        // terminal turn or session end rather than waiting for stream closure.
+        settled = event.data.outcome === "completed";
         break;
       }
     }

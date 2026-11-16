@@ -1,4 +1,43 @@
-import type { InputRequest } from "eve/client";
+import type { Interaction } from "eve/events";
+
+/**
+ * The Photon approval flow's view of one pending Eve interaction. `requestId`
+ * is Eve's `interactionId`; the name is kept because approval records store it.
+ */
+export interface PhotonApprovalRequest {
+  readonly action: {
+    readonly callId?: string;
+    readonly input: Record<string, unknown>;
+    readonly toolName: string;
+  };
+  readonly allowFreeform?: boolean;
+  readonly kind: "tool-approval" | "question" | "budget";
+  readonly options?: readonly { readonly description?: string; readonly id: string; readonly label: string }[];
+  readonly prompt: string;
+  readonly requestId: string;
+}
+
+export function photonApprovalRequestFromInteraction(
+  pending: Interaction,
+): PhotonApprovalRequest {
+  const input = pending.call?.input;
+  return {
+    action: {
+      ...(pending.call ? { callId: pending.call.callId } : {}),
+      input: typeof input === "object" && input !== null && !Array.isArray(input)
+        ? (input as Record<string, unknown>)
+        : {},
+      toolName: pending.call?.name ?? "",
+    },
+    ...(pending.request.allowFreeform === undefined ? {} : { allowFreeform: pending.request.allowFreeform }),
+    kind: pending.request.kind === "approval"
+      ? "tool-approval"
+      : pending.request.kind === "budget" ? "budget" : "question",
+    ...(pending.request.options ? { options: pending.request.options } : {}),
+    prompt: pending.request.prompt,
+    requestId: pending.interactionId,
+  };
+}
 
 const MAX_APPROVAL_TEXT_LENGTH = 500;
 const ORDER_APPROVAL_WINDOW_MS = 5 * 60_000;
@@ -94,7 +133,7 @@ function orderApprovalSummary(input: Record<string, unknown>): string | null {
   return null;
 }
 
-function approvalSummary(request: InputRequest): string {
+function approvalSummary(request: PhotonApprovalRequest): string {
   if (!isPhotonApprovalSupported(request)) throw new Error("This action cannot be approved from iMessage.");
   if (request.action.toolName === "coinbase_cancel_order") {
     const input = request.action.input;
@@ -135,14 +174,14 @@ function orderPreviewExpiry(
   throw new Error("The order preview has expired or is invalid.");
 }
 
-export function isPhotonApprovalSupported(request: InputRequest): boolean {
+export function isPhotonApprovalSupported(request: PhotonApprovalRequest): boolean {
   if (request.kind !== "tool-approval") return false;
   const toolName = request.action.toolName;
   return PHOTON_SUPPORTED_COINBASE_APPROVALS.has(toolName);
 }
 
 export function createPhotonApprovalPrompt(
-  request: InputRequest,
+  request: PhotonApprovalRequest,
   nowMs = Date.now(),
 ): PhotonApprovalPrompt {
   if (request.kind !== "tool-approval") {

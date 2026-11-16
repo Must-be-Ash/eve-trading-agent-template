@@ -8,9 +8,9 @@ export function createHybridEvidenceWorkerAgentConfig(
 ) {
   return Object.freeze({
     description: "Execute one bounded public hybrid-evidence task with no conversational history.",
+    // Eve 1.0 accepts only the timeout for a runtime subagent config. The
+    // signed token budget is enforced by the worker's usage hook instead.
     limits: Object.freeze({
-      maxInputTokensPerSession: envelope.budget.inputTokens,
-      maxOutputTokensPerSession: envelope.budget.outputTokens,
       sessionTimeoutMs: HYBRID_EVIDENCE_WORKER_MAX_RUNTIME_MS,
     }),
     model: envelope.modelId,

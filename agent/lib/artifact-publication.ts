@@ -1,9 +1,5 @@
-import type {
-  ApprovalContext,
-  ApprovalStatus,
-  ToolContext,
-  ToolModelOutput,
-} from "eve/tools";
+import type { ToolContext, ToolModelOutput } from "eve/tools";
+import type { ApprovalContext, ApprovalStatus } from "eve/tools/approval";
 import { z } from "zod";
 
 import {

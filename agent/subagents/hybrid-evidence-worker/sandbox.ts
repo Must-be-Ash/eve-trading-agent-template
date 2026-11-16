@@ -1,9 +1,10 @@
 import { defineSandbox } from "eve/sandbox";
-import { docker } from "eve/sandbox/docker";
-import { vercel } from "eve/sandbox/vercel";
+import { DockerSandbox } from "eve/sandbox/docker";
+import { VercelSandbox } from "eve/sandbox/vercel";
 
-export default defineSandbox({
-  backend: process.env.VERCEL
-    ? vercel({ networkPolicy: "deny-all" })
-    : docker({ networkPolicy: "deny-all" }),
-});
+// Keep native isolation on both hosts: Vercel Sandbox when deployed, Docker locally.
+export const environment = process.env.VERCEL
+  ? VercelSandbox.environment()
+  : DockerSandbox.environment();
+
+export default defineSandbox(() => environment.open({ networkPolicy: "deny-all" }));

@@ -2,8 +2,6 @@ import { z } from "zod";
 
 import type { WorkspaceDocument } from "./workspace-state-store";
 
-export const WORKSPACE_RUNTIME_CAPABILITY_EVENT = "step.started" as const;
-
 export const SHARED_RUNTIME_HARD_DENIED_CAPABILITIES = Object.freeze([
   "broker.mutation",
   "coinbase_create_order",

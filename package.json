@@ -39,22 +39,22 @@
   },
   "dependencies": {
     "@ai-sdk/mcp": "2.0.29",
-    "@chat-adapter/state-redis": "4.37.0",
+    "@chat-adapter/state-redis": "4.45.0",
     "@coinbase/coinbase-cli": "0.0.6",
     "@photon-ai/chat-adapter-imessage": "3.2.0",
     "@upstash/redis": "1.38.2",
     "@vercel/blob": "2.8.0",
-    "@vercel/connect": "0.6.1",
-    "ai": "7.0.58",
-    "chat": "4.37.0",
-    "eve": "0.33.0",
+    "@vercel/connect": "2.9.3",
+    "ai": "7.0.173",
+    "chat": "4.45.0",
+    "eve": "1.0.0",
     "next": "16.3.8",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-markdown": "10.1.0",
     "undici": "7.29.1",
     "zod": "4.4.3",
-    "@adaam/eve-workspace-runtime-bridge": "file:packages/adaam-eve-workspace-runtime-bridge-0.0.3.tgz"
+    "@adaam/eve-workspace-runtime-bridge": "file:packages/adaam-eve-workspace-runtime-bridge-0.1.0.tgz"
   },
   "devDependencies": {
     "@types/node": "24.13.3",
@@ -66,7 +66,7 @@
   "overrides": {
     "@opentelemetry/core": "2.12.0",
     "eve": {
-      "undici": "8.10.2"
+      "undici": "8.12.4"
     },
     "undici@7": "$undici"
   }

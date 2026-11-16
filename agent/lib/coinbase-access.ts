@@ -1,5 +1,5 @@
 import type { SessionAuthContext, SessionContext } from "eve/context";
-import type { ApprovalContext, ApprovalStatus } from "eve/tools";
+import type { ApprovalContext, ApprovalStatus } from "eve/tools/approval";
 
 import { isPhotonPrincipalAllowed } from "./photon-auth";
 

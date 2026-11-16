@@ -135,14 +135,14 @@ test("Coinbase pages preserve precise values and reject partial lists before adv
 test("only allowlisted Photon owners can discover reads or request order approval", async () => {
   resetProvider();
   const owner = context();
-  const definitions = await api.dynamicTools.events["step.started"]({}, owner);
+  const definitions = await api.dynamicTools[Symbol.for("eve.dynamic")](owner);
   assert.ok(definitions.coinbase_balance);
   for (const forbidden of ["coinbase_orders_create", "coinbase_orders_cancel", "coinbase_transfer", "coinbase_convert_execute", "coinbase_portfolios_delete"]) {
     assert.equal(definitions[forbidden], undefined);
   }
   assert.equal(await api.createTool.approval(owner), "user-approval");
   const outsider = context("outsider", "imessage:+15555550101");
-  assert.equal(await api.dynamicTools.events["step.started"]({}, outsider), null);
+  assert.equal(await api.dynamicTools[Symbol.for("eve.dynamic")](outsider), null);
   assert.equal((await api.createTool.approval(outsider)).type, "denied");
   await assert.rejects(api.previewTool.execute(ORDER, outsider), /not authorized/u);
   await assert.rejects(definitions.coinbase_balance.execute({}, outsider), /not authorized/u);

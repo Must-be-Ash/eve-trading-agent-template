@@ -1,4 +1,5 @@
-import type { AttachSessionFn } from "eve/channels";
+import { SessionStrandedError, type AttachSessionFn } from "eve/channels";
+import { SessionNotActiveError } from "eve/client";
 import {
   completePhotonApprovalDecision,
   failPhotonApprovalDecision,
@@ -36,17 +37,20 @@ export async function deliverPhotonApproval(
     }
   }
   try {
-    const result = await attachSession(delivery.sessionId).respond(
-      [{ optionId: delivery.decision, requestId: delivery.requestId }],
+    // Eve 1.0 resolves `respond` once the server admits the answer and throws
+    // when it refuses it, so a resolved delivery is the old "accepted" status.
+    await attachSession(delivery.sessionId).respond(
+      [{ interactionId: delivery.requestId, optionId: delivery.decision }],
       { auth: photonAuth(senderId, delivery.threadId, scope) },
     );
-    if (result.status !== "accepted") {
+    await completePhotonApprovalDecision(delivery);
+    return "accepted";
+  } catch (error) {
+    // Eve guarantees these refusals admitted nothing, so nothing can execute.
+    if (SessionNotActiveError.is(error) || SessionStrandedError.is(error)) {
       await failPhotonApprovalDecision(delivery).catch(() => undefined);
       return "unavailable";
     }
-    await completePhotonApprovalDecision(delivery);
-    return "accepted";
-  } catch {
     // Approval may already have reached Eve. Keep its guard until execution is
     // reconciled; a retry could execute the same financial action twice.
     if (delivery.decision === "deny") {

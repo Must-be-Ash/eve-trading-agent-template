@@ -54,28 +54,24 @@ function spotOnlyInput(toolName: string, input: Record<string, unknown>): Record
   return input;
 }
 
-export default defineDynamic({
-  events: {
-    "step.started": async (_event, ctx) => {
-      const principal = coinbasePrincipal(ctx.session);
-      if (!principal || !coinbasePrincipalAllowed(principal)) return null;
-      const definitions = (await availableTools()).filter((definition) => READ_ONLY_TOOLS.has(definition.name));
-      return Object.fromEntries(definitions.map((definition) => [
-        definition.name,
-        defineTool({
-          description: `${definition.description ?? definition.name} Read-only; available to the allowlisted owner.`,
-          inputSchema: definition.inputSchema,
-          approval: (approvalCtx) => coinbaseApproval(approvalCtx, false),
-          async execute(input, toolCtx) {
-            requireCoinbaseAccess(toolCtx);
-            return callCoinbaseMcpTool(
-              definition.name,
-              spotOnlyInput(definition.name, validateCoinbaseMcpInput(input)),
-              { signal: toolCtx.abortSignal },
-            );
-          },
-        }),
-      ]));
-    },
-  },
+export default defineDynamic(async (ctx) => {
+  const principal = coinbasePrincipal(ctx.session);
+  if (!principal || !coinbasePrincipalAllowed(principal)) return null;
+  const definitions = (await availableTools()).filter((definition) => READ_ONLY_TOOLS.has(definition.name));
+  return Object.fromEntries(definitions.map((definition) => [
+    definition.name,
+    defineTool({
+      description: `${definition.description ?? definition.name} Read-only; available to the allowlisted owner.`,
+      inputSchema: definition.inputSchema,
+      approval: (approvalCtx) => coinbaseApproval(approvalCtx, false),
+      async execute(input, toolCtx) {
+        requireCoinbaseAccess(toolCtx);
+        return callCoinbaseMcpTool(
+          definition.name,
+          spotOnlyInput(definition.name, validateCoinbaseMcpInput(input)),
+          { signal: toolCtx.abortSignal },
+        );
+      },
+    }),
+  ]));
 });

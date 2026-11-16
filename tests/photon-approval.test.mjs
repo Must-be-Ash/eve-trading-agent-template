@@ -95,18 +95,26 @@ test("approval lifecycle is atomic, one-use, sender-bound, and retains uncertain
     await owners.activatePhotonApproval({ ...appScope, approvalToken: appApproval.approvalToken });
     const responses = [];
     const requestBody = { approvalToken: appApproval.approvalToken, decision: "approve" };
-    const args = { attachSession: (id) => ({ respond: async (inputResponses, options) => {
-      responses.push({ id, inputResponses, options });
-      return { sessionId: id, status: "accepted" };
+    const args = { attachSession: (id) => ({ respond: async (answers, options) => {
+      responses.push({ id, answers, options });
+      return { sessionId: id, deliveryId: "delivery-app" };
     } }) };
     const response = await handler("/decision")(post("/eve/v1/photon-approval/decision", requestBody), args);
     assert.equal(response.status, 200);
     assert.equal((await response.json()).status, "approved");
-    assert.deepEqual(responses[0].inputResponses, [{ requestId: "request-app", optionId: "approve" }]);
+    assert.deepEqual(responses[0].answers, [{ interactionId: "request-app", optionId: "approve" }]);
     assert.equal(responses[0].id, appScope.sessionId);
     assert.equal(responses[0].options.auth.principalId, principalId);
     await handler("/decision")(post("/eve/v1/photon-approval/decision", requestBody), args);
     assert.equal(responses.length, 1, "repeat button cannot deliver another approval");
+
+    const refusedScope = scope("refused");
+    const refused = await owners.savePhotonApproval({ ...refusedScope, prompt: prompt("refused") });
+    await owners.activatePhotonApproval({ ...refusedScope, approvalToken: refused.approvalToken });
+    const { SessionNotActiveError } = await import("eve/client");
+    const refusingArgs = { attachSession: () => ({ respond: async () => { throw new SessionNotActiveError(); } }) };
+    await handler("/decision")(post("/eve/v1/photon-approval/decision", { approvalToken: refused.approvalToken, decision: "approve" }), refusingArgs);
+    assert.equal(await owners.getCurrentPhotonApprovalActivity(refusedScope), null, "an approval Eve refused before admission must not block the thread");
 
     const revokedScope = scope("revoked");
     const revoked = await owners.savePhotonApproval({ ...revokedScope, prompt: prompt("revoked") });

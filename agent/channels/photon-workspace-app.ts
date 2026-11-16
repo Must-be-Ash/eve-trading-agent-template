@@ -254,7 +254,7 @@ const runtimeActionRequestSchema = z.discriminatedUnion("action", [
 ]);
 
 type AttachSession = (sessionId: string) => {
-  reset(options: { reason: string }): Promise<unknown>;
+  end(options: { reason: string }): Promise<unknown>;
 };
 
 function responseHeaders(contentType: string): Record<string, string> {
@@ -480,7 +480,7 @@ async function resetRetiredSession(
 ): Promise<boolean> {
   if (!retiredSessionId) return false;
   try {
-    await attachSession(retiredSessionId).reset({
+    await attachSession(retiredSessionId).end({
       reason: "The owner started a fresh Photon session.",
     });
     return true;

@@ -199,8 +199,4 @@ export async function resolveHybridEvidenceWorkerCapabilities(
   }
 }
 
-export default defineDynamic({
-  events: {
-    "step.started": (_event, ctx) => resolveHybridEvidenceWorkerCapabilities(ctx),
-  },
-});
+export default defineDynamic((ctx) => resolveHybridEvidenceWorkerCapabilities(ctx));

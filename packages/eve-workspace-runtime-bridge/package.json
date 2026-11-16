@@ -1,6 +1,6 @@
 {
   "name": "@adaam/eve-workspace-runtime-bridge",
-  "version": "0.0.3",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "exports": {
@@ -9,8 +9,8 @@
       "default": "./index.js"
     }
   },
-  "dependencies": {
-    "eve": "0.33.0"
-  },
-  "license": "MIT"
+  "license": "MIT",
+  "peerDependencies": {
+    "eve": "1.0.0"
+  }
 }

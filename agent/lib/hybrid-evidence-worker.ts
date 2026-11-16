@@ -10,6 +10,7 @@ import type {
   RunHandle,
   Runtime,
 } from "../../node_modules/eve/dist/src/channel/types.js";
+import type { MessageContent } from "../../node_modules/eve/dist/src/shared/message-content.js";
 import { createNodeTargetedWorkflowRuntime } from "@adaam/eve-workspace-runtime-bridge";
 
 import {
@@ -93,15 +94,16 @@ export async function drainHybridEvidenceWorker(handle: RunHandle): Promise<{ in
     while (true) {
       const next = await reader.read();
       if (next.done) break;
-      if (next.value.type === "step.completed") {
+      if (next.value.type === "usage.recorded" && next.value.data.kind === "model") {
         const usage = next.value.data.usage;
-        if (!usage || usage.inputTokens === undefined || usage.outputTokens === undefined) continue;
         sawUsage = true;
         inputTokens += usage.inputTokens;
         outputTokens += usage.outputTokens;
         if (usage.costUsd === undefined) sawMissingCost = true;
         else paidCostUsd += usage.costUsd;
       }
+      // Eve 1.0 keeps an idle session's stream open after its turn settles.
+      if (next.value.type === "turn.settled" || next.value.type === "session.ended") break;
     }
   } finally {
     reader.releaseLock();
@@ -1006,21 +1008,27 @@ export async function startHybridEvidenceWorkerTask(
     undefined,
   );
   assertEnvelopeMatchesRecord(envelope, record, token);
-  const runtime = await createNodeTargetedWorkflowRuntime({
+  const runtime = createNodeTargetedWorkflowRuntime({
     // The bridge's published declaration predates Eve's durable `{ id }` model
     // reference; the compiled runtime receives that canonical form directly.
     dynamicSubagentAgentConfig: createHybridEvidenceWorkerRuntimeConfig(envelope) as never,
     nodeId: request.nodeId,
   });
   const workflowRuntime = runtime as unknown as Runtime;
+  // Eve 1.0 sessions take no per-session token limits or task mode on input;
+  // the worker's token-budget hook enforces `request.limits`, and an omitted
+  // `capabilities` keeps `requestInput` false.
   const handle = await workflowRuntime.createSession({
     adapter,
     auth: request.auth,
     continuationToken: request.continuationToken,
-    input: request.input,
-    limits: request.limits,
-    mode: request.mode,
-  }) as RunHandle;
+    input: {
+      context: request.input.context,
+      // Text and `data:` URL file parts only, which is Eve's MessageContent shape.
+      message: request.input.message as MessageContent,
+      outputSchema: request.input.outputSchema,
+    },
+  });
   await bindHybridEvidenceWorkerSessionCapability({ sessionId: handle.sessionId, token });
   return handle;
 }

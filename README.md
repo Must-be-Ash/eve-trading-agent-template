@@ -239,9 +239,10 @@ Tokens are random, stored hashed, and carried in the URL fragment. Decisions bin
 the original owner, thread, session/generation, request, and exact preview. Do not
 share approval links. Redis and Eve history are private application data.
 
-The runtime bridge in `packages/` is bundled locally and pins Eve 0.33.0 because it
-uses that version's internal durable worker interface. Upgrade the bridge and Eve
-together and rerun checks. Public schemas and playbook digests are validated during
+The template targets Eve 1.0.0. The runtime bridge in `packages/` is bundled
+locally and pins Eve 1.0.0 because Eve has no public API for a schedule to start a
+signed research-worker session; it uses Eve's internal workflow runtime. Upgrade
+the bridge and Eve together and rerun checks. Public schemas and playbook digests are validated during
 build preparation; do not edit generated catalogs manually.
 
 ## Project map
@@ -254,7 +255,7 @@ agent/subagents/    Signed, bounded research worker
 agent/lib/          Authorization, sessions, budgets, evidence, replay-safe stores
 strategy-packs/     One configurable X playbook
 app/artifacts/     Public report/chart/media viewers
-packages/          Pinned Eve runtime bridge, included in this repository
+packages/          Eve 1.0 runtime bridge (internal API), included in this repository
 tests/             Offline behavioral and safety checks
 docs/submission.md Gallery research, draft listing, remaining publication steps
 ```

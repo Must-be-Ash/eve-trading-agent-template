@@ -1,5 +1,5 @@
 import type { SessionContext } from "eve/context";
-import type { ApprovalContext, ApprovalStatus } from "eve/tools";
+import type { ApprovalContext, ApprovalStatus } from "eve/tools/approval";
 
 import { coinbaseApproval } from "./coinbase-access";
 import type { StrategyPackRuntimeCatalog } from "./strategy-pack-runtime";

@@ -184,7 +184,7 @@ export interface WorkspaceSemanticModelUsage {
 
 /*
  * What an `execute` drain may report back about a child session. Tokens are the
- * child's actual model usage (accumulated from its `step.completed` events);
+ * child's actual model usage (accumulated from its model `usage.recorded` events);
  * `paidCostUsd` is optional because a session-stream drain cannot see the child's
  * paid (Exa) cost - that is reconciled separately through the research receipt.
  * `accountedUsage` fills any field left undefined from the definition maximum, so

@@ -57,7 +57,7 @@ export async function startManagerFixture(api, label = randomUUID()) {
   const scope = { principalId: env.PHOTON_ALLOWED_PRINCIPALS, threadId: `imessage:${label}` };
   const manager = await api.mintPhotonWorkspaceManager(scope);
   const resetSessions = [];
-  const routeContext = { attachSession: sessionId => ({ reset: async options => { resetSessions.push({ sessionId, options }); return { status: 'reset' }; } }) };
+  const routeContext = { attachSession: sessionId => ({ end: async options => { resetSessions.push({ sessionId, options }); return { sessionId, deliveryId: 'fixture-end' }; } }) };
   async function request(path, body, options = {}) {
     const method = options.method ?? (body ? 'POST' : 'GET');
     const route = api.managerChannel.routes.find(candidate => candidate.method === method && candidate.path.endsWith(path));
